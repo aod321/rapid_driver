@@ -2,24 +2,40 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+fn default_usb() -> String {
+    "usb".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceEntry {
     pub name: String,
+    #[serde(default = "default_usb")]
+    pub backend: String,
+    #[serde(default)]
     pub vid: String,
+    #[serde(default)]
     pub pid: String,
     #[serde(default)]
     pub serial: String,
+    #[serde(default)]
+    pub service_type: String,
+    #[serde(default)]
     pub on_attach: String,
     #[serde(default)]
     pub on_detach: String,
+    #[serde(default)]
+    pub on_record_start: String,
+    #[serde(default)]
+    pub on_record_stop: String,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Registry {
     #[serde(default, rename = "device")]
     pub devices: Vec<DeviceEntry>,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct UsbIdentity {
     pub vid: String,
@@ -51,6 +67,7 @@ pub fn save_registry(registry: &Registry) -> Result<(), String> {
     fs::write(&path, content).map_err(|e| format!("failed to write {}: {}", path.display(), e))
 }
 
+#[cfg(target_os = "linux")]
 pub fn extract_identity(device: &udev::Device) -> Option<UsbIdentity> {
     let vid = device.property_value("ID_VENDOR_ID")?.to_str()?.to_string();
     let pid = device.property_value("ID_MODEL_ID")?.to_str()?.to_string();
@@ -63,6 +80,7 @@ pub fn extract_identity(device: &udev::Device) -> Option<UsbIdentity> {
     Some(UsbIdentity { vid, pid, serial, sysname })
 }
 
+#[cfg(target_os = "linux")]
 pub fn find_match<'a>(registry: &'a Registry, identity: &UsbIdentity) -> Option<&'a DeviceEntry> {
     // First pass: exact match (VID + PID + non-empty serial)
     for entry in &registry.devices {

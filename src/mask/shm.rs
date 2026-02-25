@@ -13,7 +13,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const MAGIC: u32 = 0x44504152;
 
 /// Shared memory file path
+#[cfg(target_os = "linux")]
 pub const SHM_PATH: &str = "/dev/shm/rapid_hardware_mask";
+#[cfg(not(target_os = "linux"))]
+pub const SHM_PATH: &str = "/tmp/rapid_hardware_mask";
 
 /// Protocol version
 pub const VERSION: u8 = 1;

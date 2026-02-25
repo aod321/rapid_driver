@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-udev = "0.9"
+mdns-sd = "0.11"
 nix = { version = "0.29", features = ["poll", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -14,3 +14,10 @@ dirs = "6"
 crossterm = "0.28"
 ratatui = "0.29"
 chrono = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+udev = "0.9"

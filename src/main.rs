@@ -1,13 +1,20 @@
+mod api;
+mod discovery;
+mod engine;
 mod mask;
 mod registry;
 mod tui;
+#[cfg(target_os = "linux")]
 mod udev_rule;
 
 use clap::{Parser, Subcommand};
+use engine::command::{EngineCommand, EngineHandle};
+use engine::Engine;
 use mask::MaskLayout;
 use registry::DeviceEntry;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
+use std::sync::mpsc;
 
 #[derive(Parser)]
 #[command(name = "rapid_driver", about = "Device-triggered process manager", infer_subcommands = true)]
@@ -21,6 +28,19 @@ enum Commands {
     /// Load registry and monitor USB hotplug events (default)
     #[command(visible_alias = "mon")]
     Monitor {
+        /// Disable hardware mask publishing to shared memory
+        #[arg(long)]
+        no_mask: bool,
+        /// Enable HTTP API server (e.g. --api 0.0.0.0:7400)
+        #[arg(long)]
+        api: Option<String>,
+    },
+    /// Headless daemon with HTTP API server
+    #[command(visible_alias = "srv")]
+    Serve {
+        /// API server bind address
+        #[arg(long, default_value = "0.0.0.0:7400")]
+        bind: String,
         /// Disable hardware mask publishing to shared memory
         #[arg(long)]
         no_mask: bool,
@@ -74,17 +94,66 @@ enum MaskLayoutAction {
 fn main() {
     let cli = Cli::parse();
 
-    match cli.command.unwrap_or(Commands::Monitor { no_mask: false }) {
-        Commands::Monitor { no_mask } => cmd_monitor(!no_mask),
+    match cli
+        .command
+        .unwrap_or(Commands::Monitor { no_mask: false, api: None })
+    {
+        Commands::Monitor { no_mask, api } => cmd_monitor(!no_mask, api),
+        Commands::Serve { bind, no_mask } => cmd_serve(&bind, !no_mask),
         Commands::Register => cmd_register(),
         Commands::List => cmd_list(),
         Commands::Unregister { name } => cmd_unregister(&name),
-        Commands::Logs { name, lines, follow } => cmd_logs(name, lines, follow),
+        Commands::Logs {
+            name,
+            lines,
+            follow,
+        } => cmd_logs(name, lines, follow),
         Commands::MaskLayout { action } => cmd_mask_layout(action),
     }
 }
 
-fn cmd_monitor(mask_enabled: bool) {
+/// Build discovery sources from registry.
+fn build_discovery_sources(
+    registry: &registry::Registry,
+) -> Vec<Box<dyn discovery::DiscoverySource>> {
+    let mut sources: Vec<Box<dyn discovery::DiscoverySource>> = Vec::new();
+
+    #[cfg(target_os = "linux")]
+    {
+        if registry.devices.iter().any(|e| e.backend == "usb") {
+            sources.push(Box::new(discovery::usb::UsbDiscovery::new(
+                registry.clone(),
+            )));
+        }
+    }
+
+    if registry.devices.iter().any(|e| e.backend == "mdns") {
+        sources.push(Box::new(discovery::mdns::MdnsDiscovery::new(
+            registry.clone(),
+        )));
+    }
+
+    sources
+}
+
+/// Create engine + handle pair, spawn engine thread.
+fn spawn_engine(
+    reg: registry::Registry,
+    mask_enabled: bool,
+) -> (EngineHandle, std::thread::JoinHandle<()>) {
+    let sources = build_discovery_sources(&reg);
+    let (cmd_tx, cmd_rx) = mpsc::sync_channel(64);
+    let handle = EngineHandle::new(cmd_tx);
+
+    let engine_thread = std::thread::spawn(move || {
+        let mut engine = Engine::new(reg, mask_enabled, sources, cmd_rx);
+        engine.run();
+    });
+
+    (handle, engine_thread)
+}
+
+fn cmd_monitor(mask_enabled: bool, api_bind: Option<String>) {
     let reg = match registry::load_registry() {
         Ok(r) => r,
         Err(e) => {
@@ -97,10 +166,78 @@ fn cmd_monitor(mask_enabled: bool) {
         println!("Warning: registry is empty. Use 'rapid_driver register' to add devices.");
     }
 
-    if let Err(e) = tui::run_tui(reg, mask_enabled) {
-        eprintln!("TUI error: {}", e);
-        std::process::exit(1);
+    let (handle, engine_thread) = spawn_engine(reg, mask_enabled);
+
+    // Optionally spawn API server thread
+    if let Some(bind) = api_bind {
+        let api_handle = handle.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime");
+            rt.block_on(async {
+                let app = api::build_router(api_handle);
+                let listener = tokio::net::TcpListener::bind(&bind)
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("Failed to bind API to {}: {}", bind, e);
+                        std::process::exit(1);
+                    });
+                eprintln!("API server listening on {}", bind);
+                axum::serve(listener, app).await.unwrap();
+            });
+        });
     }
+
+    // Run TUI on main thread
+    if let Err(e) = tui::run_tui(handle.clone(), mask_enabled) {
+        eprintln!("TUI error: {}", e);
+    }
+
+    // Signal engine shutdown
+    let _ = handle.send(EngineCommand::Shutdown);
+    let _ = engine_thread.join();
+}
+
+fn cmd_serve(bind: &str, mask_enabled: bool) {
+    let reg = match registry::load_registry() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error loading registry: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if reg.devices.is_empty() {
+        println!("Warning: registry is empty. Use 'rapid_driver register' to add devices.");
+    }
+
+    let (handle, engine_thread) = spawn_engine(reg, mask_enabled);
+
+    // Run API server on main thread
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+
+    let api_handle = handle.clone();
+    let bind = bind.to_string();
+    rt.block_on(async {
+        let app = api::build_router(api_handle);
+        let listener = tokio::net::TcpListener::bind(&bind)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to bind to {}: {}", bind, e);
+                std::process::exit(1);
+            });
+        println!("rapid_driver serving on http://{}", bind);
+        println!("Press Ctrl+C to stop.");
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let _ = handle.send(EngineCommand::Shutdown);
+    let _ = engine_thread.join();
 }
 
 fn cmd_register() {
@@ -112,7 +249,124 @@ fn cmd_register() {
         }
     };
 
-    // Enumerate current USB devices
+    let stdin = io::stdin();
+    let mut lines = stdin.lock().lines();
+
+    // Ask for backend type
+    println!("Select backend:");
+    println!("  [1] USB (udev hotplug)");
+    println!("  [2] mDNS (Bonjour/Zeroconf)");
+    print!("Choice [1]: ");
+    io::stdout().flush().unwrap();
+    let backend_choice = match lines.next() {
+        Some(Ok(line)) => line.trim().to_string(),
+        _ => return,
+    };
+    let backend = match backend_choice.as_str() {
+        "" | "1" => "usb",
+        "2" => "mdns",
+        _ => {
+            eprintln!("Invalid selection.");
+            return;
+        }
+    };
+
+    match backend {
+        "usb" => register_usb_device(&mut reg, &mut lines),
+        "mdns" => register_mdns_device(&mut reg, &mut lines),
+        _ => unreachable!(),
+    }
+}
+
+fn register_mdns_device(
+    reg: &mut registry::Registry,
+    lines: &mut std::io::Lines<std::io::StdinLock>,
+) {
+    print!("Enter a name for this device: ");
+    io::stdout().flush().unwrap();
+    let name = match lines.next() {
+        Some(Ok(line)) => line.trim().to_string(),
+        _ => return,
+    };
+    if name.is_empty() {
+        eprintln!("Name cannot be empty.");
+        return;
+    }
+    if reg.devices.iter().any(|e| e.name == name) {
+        eprintln!("Name '{}' already exists in registry.", name);
+        return;
+    }
+
+    print!("Enter mDNS service type (e.g. _iphonevio._tcp.local.): ");
+    io::stdout().flush().unwrap();
+    let service_type = match lines.next() {
+        Some(Ok(line)) => line.trim().to_string(),
+        _ => return,
+    };
+    if service_type.is_empty() {
+        eprintln!("Service type cannot be empty.");
+        return;
+    }
+
+    print!("Enter on_attach command: ");
+    io::stdout().flush().unwrap();
+    let on_attach = match lines.next() {
+        Some(Ok(line)) => line.trim().to_string(),
+        _ => return,
+    };
+    if on_attach.is_empty() {
+        eprintln!("on_attach command cannot be empty.");
+        return;
+    }
+
+    print!("Enter on_detach command (optional, press Enter to skip): ");
+    io::stdout().flush().unwrap();
+    let on_detach = match lines.next() {
+        Some(Ok(line)) => line.trim().to_string(),
+        _ => String::new(),
+    };
+
+    print!("Enter on_record_start command (optional): ");
+    io::stdout().flush().unwrap();
+    let on_record_start = match lines.next() {
+        Some(Ok(line)) => line.trim().to_string(),
+        _ => String::new(),
+    };
+
+    print!("Enter on_record_stop command (optional): ");
+    io::stdout().flush().unwrap();
+    let on_record_stop = match lines.next() {
+        Some(Ok(line)) => line.trim().to_string(),
+        _ => String::new(),
+    };
+
+    let entry = DeviceEntry {
+        name: name.clone(),
+        backend: "mdns".to_string(),
+        vid: String::new(),
+        pid: String::new(),
+        serial: String::new(),
+        service_type,
+        on_attach,
+        on_detach,
+        on_record_start,
+        on_record_stop,
+    };
+
+    println!("\nRegistering: {:?}", entry);
+    reg.devices.push(entry);
+
+    match registry::save_registry(reg) {
+        Ok(()) => println!("Saved to {}", registry::registry_path().display()),
+        Err(e) => eprintln!("Error saving registry: {}", e),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn register_usb_device(
+    reg: &mut registry::Registry,
+    lines: &mut std::io::Lines<std::io::StdinLock>,
+) {
     let mut enumerator = udev::Enumerator::new().expect("failed to create enumerator");
     enumerator
         .match_subsystem("usb")
@@ -153,10 +407,6 @@ fn cmd_register() {
         );
     }
 
-    let stdin = io::stdin();
-    let mut lines = stdin.lock().lines();
-
-    // Select device
     print!("\nSelect device number: ");
     io::stdout().flush().unwrap();
     let idx: usize = match lines.next() {
@@ -172,7 +422,6 @@ fn cmd_register() {
 
     let (identity, _) = &devices[idx];
 
-    // Enter name
     print!("Enter a name for this device: ");
     io::stdout().flush().unwrap();
     let name = match lines.next() {
@@ -188,7 +437,6 @@ fn cmd_register() {
         return;
     }
 
-    // Enter on_attach command
     print!("Enter on_attach command: ");
     io::stdout().flush().unwrap();
     let on_attach = match lines.next() {
@@ -200,7 +448,6 @@ fn cmd_register() {
         return;
     }
 
-    // Enter on_detach command (optional)
     print!("Enter on_detach command (optional, press Enter to skip): ");
     io::stdout().flush().unwrap();
     let on_detach = match lines.next() {
@@ -208,7 +455,6 @@ fn cmd_register() {
         _ => String::new(),
     };
 
-    // Ask about serial matching
     let serial = if !identity.serial.is_empty() {
         print!(
             "Use serial '{}' for exact matching? (y/N): ",
@@ -223,29 +469,32 @@ fn cmd_register() {
         String::new()
     };
 
-    // Ask about creating udev symlink
     print!("Create udev symlink /dev/{}? (y/N): ", name);
     io::stdout().flush().unwrap();
-    let create_udev = matches!(lines.next(), Some(Ok(line)) if line.trim().eq_ignore_ascii_case("y"));
+    let create_udev =
+        matches!(lines.next(), Some(Ok(line)) if line.trim().eq_ignore_ascii_case("y"));
 
     let entry = DeviceEntry {
         name: name.clone(),
+        backend: "usb".to_string(),
         vid: identity.vid.clone(),
         pid: identity.pid.clone(),
         serial,
+        service_type: String::new(),
         on_attach,
         on_detach,
+        on_record_start: String::new(),
+        on_record_stop: String::new(),
     };
 
     println!("\nRegistering: {:?}", entry);
     reg.devices.push(entry.clone());
 
-    match registry::save_registry(&reg) {
+    match registry::save_registry(reg) {
         Ok(()) => println!("Saved to {}", registry::registry_path().display()),
         Err(e) => eprintln!("Error saving registry: {}", e),
     }
 
-    // Create udev rule if requested
     if create_udev {
         match udev_rule::create_udev_rule(&entry) {
             Ok(path) => {
@@ -265,6 +514,14 @@ fn cmd_register() {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn register_usb_device(
+    _reg: &mut registry::Registry,
+    _lines: &mut std::io::Lines<std::io::StdinLock>,
+) {
+    eprintln!("USB device registration is only supported on Linux.");
+}
+
 fn cmd_list() {
     let reg = match registry::load_registry() {
         Ok(r) => r,
@@ -280,17 +537,21 @@ fn cmd_list() {
     }
 
     println!(
-        "{:<20} {:<10} {:<12} {:<30} {}",
-        "NAME", "VID:PID", "SERIAL", "ON_ATTACH", "ON_DETACH"
+        "{:<20} {:<8} {:<10} {:<20} {:<30} {}",
+        "NAME", "BACKEND", "VID:PID", "SERVICE_TYPE", "ON_ATTACH", "ON_DETACH"
     );
-    println!("{}", "-".repeat(90));
+    println!("{}", "-".repeat(110));
 
     for entry in &reg.devices {
-        let vid_pid = format!("{}:{}", entry.vid, entry.pid);
-        let serial = if entry.serial.is_empty() {
-            "(any)"
+        let vid_pid = if entry.vid.is_empty() && entry.pid.is_empty() {
+            "-".to_string()
         } else {
-            &entry.serial
+            format!("{}:{}", entry.vid, entry.pid)
+        };
+        let service_type = if entry.service_type.is_empty() {
+            "-"
+        } else {
+            &entry.service_type
         };
         let on_detach = if entry.on_detach.is_empty() {
             "(none)"
@@ -298,8 +559,8 @@ fn cmd_list() {
             &entry.on_detach
         };
         println!(
-            "{:<20} {:<10} {:<12} {:<30} {}",
-            entry.name, vid_pid, serial, entry.on_attach, on_detach
+            "{:<20} {:<8} {:<10} {:<20} {:<30} {}",
+            entry.name, entry.backend, vid_pid, service_type, entry.on_attach, on_detach
         );
     }
 }
@@ -326,13 +587,15 @@ fn cmd_unregister(name: &str) {
         Err(e) => eprintln!("Error saving registry: {}", e),
     }
 
-    // Also remove udev rule if exists
-    match udev_rule::remove_udev_rule(name) {
-        Ok(()) => {
-            println!("Removed udev rule for '{}'.", name);
-            let _ = udev_rule::reload_udev();
+    #[cfg(target_os = "linux")]
+    {
+        match udev_rule::remove_udev_rule(name) {
+            Ok(()) => {
+                println!("Removed udev rule for '{}'.", name);
+                let _ = udev_rule::reload_udev();
+            }
+            Err(e) => eprintln!("Warning: {}", e),
         }
-        Err(e) => eprintln!("Warning: {}", e),
     }
 }
 
@@ -353,7 +616,6 @@ fn cmd_logs(name: Option<String>, lines: usize, follow: bool) {
         return;
     }
 
-    // Get log files to display
     let log_files: Vec<PathBuf> = if let Some(ref device_name) = name {
         let path = log_dir.join(format!("{}.log", device_name));
         if path.exists() {
@@ -363,7 +625,6 @@ fn cmd_logs(name: Option<String>, lines: usize, follow: bool) {
             return;
         }
     } else {
-        // List all log files
         match fs::read_dir(&log_dir) {
             Ok(entries) => entries
                 .filter_map(|e| e.ok())
@@ -382,7 +643,6 @@ fn cmd_logs(name: Option<String>, lines: usize, follow: bool) {
         return;
     }
 
-    // Display last N lines of each file
     for log_path in &log_files {
         let device_name = log_path
             .file_stem()
@@ -402,7 +662,6 @@ fn cmd_logs(name: Option<String>, lines: usize, follow: bool) {
         println!();
     }
 
-    // Follow mode
     if follow {
         println!("--- Following logs (Ctrl+C to stop) ---\n");
 
@@ -465,9 +724,11 @@ fn cmd_mask_layout(action: MaskLayoutAction) {
                 println!("[{:>2}] {:<20} {}", bit, name, status);
             }
 
-            // Show devices in registry but not in layout
             let layout_names: std::collections::HashSet<_> = layout.device_order.iter().collect();
-            let missing: Vec<_> = device_names.iter().filter(|n| !layout_names.contains(n)).collect();
+            let missing: Vec<_> = device_names
+                .iter()
+                .filter(|n| !layout_names.contains(n))
+                .collect();
             if !missing.is_empty() {
                 println!("\nDevices in registry but not in layout (will be added):");
                 for name in missing {
@@ -485,26 +746,22 @@ fn cmd_mask_layout(action: MaskLayoutAction) {
                 }
             }
         }
-        MaskLayoutAction::Import { path } => {
-            match MaskLayout::import(&path) {
-                Ok(layout) => {
-                    match layout.save() {
-                        Ok(()) => {
-                            println!("Imported layout from: {}", path.display());
-                            println!("Saved to: {}", MaskLayout::config_path().display());
-                        }
-                        Err(e) => {
-                            eprintln!("Error saving layout: {}", e);
-                            std::process::exit(1);
-                        }
-                    }
+        MaskLayoutAction::Import { path } => match MaskLayout::import(&path) {
+            Ok(layout) => match layout.save() {
+                Ok(()) => {
+                    println!("Imported layout from: {}", path.display());
+                    println!("Saved to: {}", MaskLayout::config_path().display());
                 }
                 Err(e) => {
-                    eprintln!("Error importing layout: {}", e);
+                    eprintln!("Error saving layout: {}", e);
                     std::process::exit(1);
                 }
+            },
+            Err(e) => {
+                eprintln!("Error importing layout: {}", e);
+                std::process::exit(1);
             }
-        }
+        },
         MaskLayoutAction::Reset => {
             let layout = MaskLayout::from_devices_sorted(&device_names);
             match layout.save() {

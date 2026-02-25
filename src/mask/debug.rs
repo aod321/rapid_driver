@@ -10,7 +10,10 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::time::Instant;
 
 /// Debug output file path
+#[cfg(target_os = "linux")]
 pub const DEBUG_PATH: &str = "/dev/shm/rapid_hardware_mask.json";
+#[cfg(not(target_os = "linux"))]
+pub const DEBUG_PATH: &str = "/tmp/rapid_hardware_mask.json";
 
 /// Debug state structure for JSON output.
 #[derive(Debug, Clone, Serialize)]

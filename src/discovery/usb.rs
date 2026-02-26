@@ -1,7 +1,7 @@
 //! USB device discovery via udev (Linux only).
 
 use crate::discovery::{DiscoveredDevice, DiscoveryEvent, DiscoverySource};
-use crate::registry::{self, DeviceEntry, Registry};
+use crate::registry::{self, Registry};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 

@@ -22,6 +22,7 @@ pub fn router() -> Router<EngineHandle> {
         .route("/registry", post(add_device))
         .route("/registry/{name}", delete(remove_device))
         .route("/mask", get(get_mask))
+        .route("/ready", get(get_ready))
         .route("/recording/start", post(start_recording))
         .route("/recording/stop", post(stop_recording))
         .route("/recording/status", get(get_recording_status))
@@ -139,6 +140,8 @@ struct AddDeviceRequest {
     on_record_start: Option<String>,
     #[serde(default)]
     on_record_stop: Option<String>,
+    #[serde(default)]
+    sensor_type: Option<String>,
 }
 
 async fn add_device(
@@ -156,6 +159,7 @@ async fn add_device(
         on_detach: req.on_detach.unwrap_or_default(),
         on_record_start: req.on_record_start.unwrap_or_default(),
         on_record_stop: req.on_record_stop.unwrap_or_default(),
+        sensor_type: req.sensor_type.unwrap_or_default(),
     };
     match engine_request(handle, EngineCommand::AddDevice { entry }).await {
         Ok(EngineResponse::Ok) => Json(serde_json::json!({"ok": true})).into_response(),
@@ -179,6 +183,27 @@ async fn remove_device(
             Json(serde_json::json!({"error": e})),
         )
             .into_response(),
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn get_ready(State(handle): State<EngineHandle>) -> impl IntoResponse {
+    match engine_request(handle, EngineCommand::GetStatus).await {
+        Ok(EngineResponse::Status(status)) => {
+            let total = status.devices.len();
+            let online = status
+                .devices
+                .iter()
+                .filter(|d| d.online && d.process_running)
+                .count();
+            let ready = total > 0 && online == total;
+            Json(serde_json::json!({
+                "ready": ready,
+                "online": online,
+                "total": total,
+            }))
+            .into_response()
+        }
         _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }

@@ -1,6 +1,7 @@
 //! Core engine: owns all runtime state, runs 500Hz main loop.
 
 pub mod command;
+pub mod recorder;
 pub mod recording;
 
 use std::collections::{HashMap, HashSet};
@@ -21,6 +22,7 @@ use crate::registry::{self, DeviceEntry, Registry};
 use command::{
     DeviceStatus, EngineCommand, EngineResponse, EngineStatus, RecordingInfo,
 };
+use recorder::RecorderCore;
 use recording::{RecordingSession, RecordingState};
 
 /// Running process information.
@@ -79,6 +81,9 @@ pub struct Engine {
 
     // Recording
     recording: Option<RecordingSession>,
+
+    // MCAP recorder
+    recorder: RecorderCore,
 
     // Non-blocking restarts
     pending_restarts: Vec<PendingRestart>,
@@ -150,6 +155,7 @@ impl Engine {
             measured_freq: 0.0,
             log_dir,
             recording: None,
+            recorder: RecorderCore::new(),
             pending_restarts: Vec::new(),
             cmd_rx,
         }
@@ -172,6 +178,7 @@ impl Engine {
             self.reap_exited();
             self.process_pending_restarts();
             self.check_recording();
+            self.tick_recorder();
 
             // Precise timing for 500Hz when mask enabled
             if self.mask_enabled {
@@ -192,6 +199,11 @@ impl Engine {
         }
 
         // Cleanup
+        if self.recorder.is_active() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = self.recorder.stop_recording();
+            }));
+        }
         self.kill_all();
         self.shutdown_discovery();
         if self.mask_enabled {
@@ -283,12 +295,17 @@ impl Engine {
     }
 
     fn build_recording_info(&self) -> Option<RecordingInfo> {
-        self.recording.as_ref().map(|r| RecordingInfo {
-            session_id: r.session_id.clone(),
-            state: r.state.as_str().to_string(),
-            devices: r.device_state_strings(),
-            output_dir: r.output_dir.clone(),
-            elapsed_secs: r.created_at.elapsed().as_secs_f64(),
+        self.recording.as_ref().map(|r| {
+            let mcap_stats = self.recorder.stats();
+            RecordingInfo {
+                session_id: r.session_id.clone(),
+                state: r.state.as_str().to_string(),
+                devices: r.device_state_strings(),
+                output_dir: r.output_dir.clone(),
+                elapsed_secs: r.created_at.elapsed().as_secs_f64(),
+                mcap_message_count: mcap_stats.as_ref().map(|s| s.message_count),
+                mcap_file: mcap_stats.map(|s| s.output_path),
+            }
         })
     }
 
@@ -385,6 +402,36 @@ impl Engine {
 
     // ── Recording commands ──────────────────────────────────────────
 
+    fn parse_u16_flag(cmd: &str, flag: &str) -> Option<u16> {
+        let mut parts = cmd.split_whitespace();
+        let prefix = format!("{flag}=");
+        while let Some(part) = parts.next() {
+            if part == flag {
+                if let Some(v) = parts.next() {
+                    if let Ok(port) = v.parse::<u16>() {
+                        return Some(port);
+                    }
+                }
+            } else if let Some(v) = part.strip_prefix(&prefix) {
+                if let Ok(port) = v.parse::<u16>() {
+                    return Some(port);
+                }
+            }
+        }
+        None
+    }
+
+    fn resolve_recorder_sensor_address(&self, device_name: &str, entry: &DeviceEntry) -> Option<String> {
+        // iPhone app's _iphonevio._tcp address points to the phone's ephemeral listener.
+        // The real recorder data source is the locally spawned node_iphone ZMQ PUB.
+        if entry.backend == "mdns" && entry.service_type.contains("_iphonevio._tcp") {
+            let data_port = Self::parse_u16_flag(&entry.on_attach, "--data-port").unwrap_or(5563);
+            return Some(format!("127.0.0.1:{data_port}"));
+        }
+
+        self.device_addresses.get(device_name).cloned()
+    }
+
     fn cmd_start_recording(
         &mut self,
         session_id: Option<String>,
@@ -401,7 +448,28 @@ impl Engine {
         }
 
         let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let output_dir = output_dir.unwrap_or_else(|| format!("/tmp/rapid_recording/{}", session_id));
+        let output_dir = output_dir.unwrap_or_else(|| {
+            let base = std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join("recordings")
+                .join(&session_id);
+            base.to_string_lossy().to_string()
+        });
+
+        // All registered devices must be connected before recording
+        let not_ready: Vec<&str> = self
+            .devices
+            .iter()
+            .filter(|d| !d.online || !d.process_running)
+            .map(|d| d.name.as_str())
+            .collect();
+
+        if !not_ready.is_empty() {
+            return EngineResponse::Error(format!(
+                "not connected: {}",
+                not_ready.join(", ")
+            ));
+        }
 
         // Determine which devices to record
         let target_devices: Vec<String> = devices.unwrap_or_else(|| {
@@ -412,21 +480,7 @@ impl Engine {
                 .collect()
         });
 
-        // Verify all target devices are online
-        let online_names: HashSet<&str> = self
-            .devices
-            .iter()
-            .filter(|d| d.online && d.process_running)
-            .map(|d| d.name.as_str())
-            .collect();
-
-        for name in &target_devices {
-            if !online_names.contains(name.as_str()) {
-                return EngineResponse::Error(format!("device '{}' is not online", name));
-            }
-        }
-
-        let mut session = RecordingSession::new(session_id, output_dir);
+        let mut session = RecordingSession::new(session_id.clone(), output_dir.clone());
 
         for name in &target_devices {
             if let Some(entry) = self.registry.devices.iter().find(|e| e.name == *name) {
@@ -435,8 +489,52 @@ impl Engine {
             }
         }
 
+        // Ensure output directory exists regardless of MCAP success
+        if let Err(e) = fs::create_dir_all(&output_dir) {
+            return EngineResponse::Error(format!("create output dir: {}", e));
+        }
+
+        // Start MCAP recorder — always, so we at least record hardware mask.
+        // Subscribe any selected online device that has a resolved data address.
+        let sensors: Vec<recorder::SensorInfo> = target_devices
+            .iter()
+            .filter_map(|name| {
+                let entry = self
+                    .registry
+                    .devices
+                    .iter()
+                    .find(|e| e.name == *name)?;
+                let addr = self.resolve_recorder_sensor_address(name, entry)?;
+                Some(recorder::SensorInfo {
+                    device_name: name.clone(),
+                    address: addr,
+                    sensor_type: entry.sensor_type.clone(),
+                })
+            })
+            .collect();
+
+        if sensors.is_empty() {
+            eprintln!(
+                "[engine] recorder: no sensor address resolved for targets {:?}; known addresses={:?}",
+                target_devices, self.device_addresses
+            );
+        }
+
+        let mcap_error = match self.recorder.start_recording(&session_id, &output_dir, sensors) {
+            Ok(()) => None,
+            Err(e) => {
+                eprintln!("[engine] MCAP recorder start error: {}", e);
+                Some(e)
+            }
+        };
+
         self.recording = Some(session);
-        EngineResponse::Ok
+
+        if let Some(e) = mcap_error {
+            EngineResponse::Error(format!("recording started but MCAP failed: {}", e))
+        } else {
+            EngineResponse::Ok
+        }
     }
 
     fn cmd_stop_recording(&mut self, _session_id: Option<String>) -> EngineResponse {
@@ -452,6 +550,26 @@ impl Engine {
                 "cannot stop recording in state '{}'",
                 session.state.as_str()
             ));
+        }
+
+        // Stop MCAP recorder (catch panics to prevent engine crash)
+        if self.recorder.is_active() {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.recorder.stop_recording()
+            })) {
+                Ok(Ok(summary)) => {
+                    eprintln!(
+                        "[engine] MCAP: {} messages, {:.1}s → {}",
+                        summary.message_count, summary.duration_secs, summary.output_path,
+                    );
+                }
+                Ok(Err(e)) => {
+                    eprintln!("[engine] MCAP recorder stop error: {}", e);
+                }
+                Err(_) => {
+                    eprintln!("[engine] MCAP recorder panicked during stop");
+                }
+            }
         }
 
         session.state = RecordingState::Stopping;
@@ -478,6 +596,32 @@ impl Engine {
         if let Some(ref mut session) = self.recording {
             session.check_progress();
         }
+    }
+
+    fn tick_recorder(&mut self) {
+        if !self.recorder.is_active() {
+            return;
+        }
+
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+
+        let mut device_map = HashMap::new();
+        for device in &self.devices {
+            device_map.insert(device.name.clone(), device.online && device.process_running);
+        }
+
+        let mask_snapshot = recorder::MaskSnapshot {
+            mask: self.current_mask,
+            sequence: self.sequence,
+            timestamp_ns: now_ns,
+            device_count: self.devices.len() as u8,
+            devices: device_map,
+        };
+
+        self.recorder.tick(Some(mask_snapshot));
     }
 
     // ── Discovery & device lifecycle ────────────────────────────────

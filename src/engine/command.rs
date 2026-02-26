@@ -40,6 +40,10 @@ pub struct RecordingInfo {
     pub devices: HashMap<String, String>,
     pub output_dir: String,
     pub elapsed_secs: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcap_message_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcap_file: Option<String>,
 }
 
 /// Commands sent to the engine.

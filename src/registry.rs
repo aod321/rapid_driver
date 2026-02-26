@@ -27,6 +27,8 @@ pub struct DeviceEntry {
     pub on_record_start: String,
     #[serde(default)]
     pub on_record_stop: String,
+    #[serde(default)]
+    pub sensor_type: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

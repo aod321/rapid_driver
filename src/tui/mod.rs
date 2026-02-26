@@ -183,6 +183,52 @@ impl App {
         }
     }
 
+    fn toggle_recording(&mut self) {
+        let is_active = self
+            .recording
+            .as_ref()
+            .is_some_and(|r| r.state == "recording" || r.state == "starting");
+
+        if is_active {
+            match self.handle.request(EngineCommand::StopRecording { session_id: None }) {
+                Ok(EngineResponse::Ok) => self.set_status("Recording stopping...".into()),
+                Ok(EngineResponse::Error(e)) => self.set_status(format!("Stop error: {}", e)),
+                _ => self.set_status("Engine error".into()),
+            }
+        } else {
+            // All devices (recorder + data nodes) must be online and running
+            if self.devices.is_empty() {
+                self.set_status("Cannot record: no devices registered".into());
+                return;
+            }
+
+            let not_ready: Vec<&str> = self
+                .devices
+                .iter()
+                .filter(|d| !d.online || !d.process_running)
+                .map(|d| d.name.as_str())
+                .collect();
+
+            if !not_ready.is_empty() {
+                self.set_status(format!(
+                    "Cannot record: not connected: {}",
+                    not_ready.join(", ")
+                ));
+                return;
+            }
+
+            match self.handle.request(EngineCommand::StartRecording {
+                session_id: None,
+                devices: None,
+                output_dir: None,
+            }) {
+                Ok(EngineResponse::Ok) => self.set_status("Recording started".into()),
+                Ok(EngineResponse::Error(e)) => self.set_status(format!("REC: {}", e)),
+                _ => self.set_status("Engine error".into()),
+            }
+        }
+    }
+
     fn update_log_cache(&mut self, device_name: &str) {
         let log_path = self.log_dir.join(format!("{}.log", device_name));
         if let Ok(file) = File::open(&log_path) {
@@ -280,6 +326,10 @@ fn handle_key(app: &mut App, key: KeyCode) -> AppEvent {
             KeyCode::Char('i') => {
                 app.mode = AppMode::Import;
                 app.input_buffer.clear();
+                AppEvent::Continue
+            }
+            KeyCode::Char('R') => {
+                app.toggle_recording();
                 AppEvent::Continue
             }
             KeyCode::Char('s') | KeyCode::Enter => {
@@ -401,8 +451,16 @@ fn ui(f: &mut Frame, app: &App) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(chunks[1]);
 
-    render_device_list(f, app, main_chunks[0]);
+    // Left side: Devices + Recorder
+    let left_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(8)])
+        .split(main_chunks[0]);
 
+    render_device_list(f, app, left_chunks[0]);
+    render_recorder_panel(f, app, left_chunks[1]);
+
+    // Right side: Mask + Log
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(8), Constraint::Min(5)])
@@ -413,7 +471,7 @@ fn ui(f: &mut Frame, app: &App) {
 
     // Footer
     let help_text = match app.mode {
-        AppMode::Monitor => "[q]uit [s/Enter]restart [r]eorder [e]xport [i]mport [↑↓]select",
+        AppMode::Monitor => "[q]uit [s/Enter]restart [r]eorder [e]xport [i]mport [R]ec [↑↓]select",
         AppMode::Reorder => "[↑↓]move [Enter]save [Esc]cancel",
         AppMode::Export => "Enter path to export: ",
         AppMode::Import => "Enter path to import: ",
@@ -581,5 +639,85 @@ fn render_log_preview(f: &mut Frame, app: &App, area: Rect) {
     let paragraph = Paragraph::new(lines)
         .block(block)
         .wrap(Wrap { trim: true });
+    f.render_widget(paragraph, area);
+}
+
+fn render_recorder_panel(f: &mut Frame, app: &App, area: Rect) {
+    let mut lines: Vec<Line> = Vec::new();
+
+    match &app.recording {
+        Some(rec) if rec.state != "stopped" && rec.state != "failed" || rec.state == "stopping" => {
+            // State indicator
+            let (icon, color) = match rec.state.as_str() {
+                "recording" => ("●", Color::Green),
+                "starting" => ("◐", Color::Yellow),
+                "stopping" => ("◐", Color::Yellow),
+                _ => ("○", Color::DarkGray),
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {} ", icon), Style::default().fg(color)),
+                Span::styled(&rec.state, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            ]));
+
+            // Session ID
+            let short_id = if rec.session_id.len() > 8 {
+                &rec.session_id[..8]
+            } else {
+                &rec.session_id
+            };
+            lines.push(Line::from(format!("  Session: {}", short_id)));
+
+            // Elapsed time and message count
+            let elapsed = rec.elapsed_secs;
+            let msgs = rec.mcap_message_count.unwrap_or(0);
+            lines.push(Line::from(format!(
+                "  Time: {:.1}s  Msgs: {}",
+                elapsed, msgs
+            )));
+
+            // Output path
+            lines.push(Line::from(vec![
+                Span::raw("  Dir: "),
+                Span::styled(&rec.output_dir, Style::default().fg(Color::DarkGray)),
+            ]));
+
+            // Separator
+            lines.push(Line::from(Span::styled(
+                "  ─────────────────────",
+                Style::default().fg(Color::DarkGray),
+            )));
+
+            // Per-device status
+            let is_active = rec.state == "recording" || rec.state == "starting";
+            for (name, state) in &rec.devices {
+                let (dev_icon, dev_color) = match state.as_str() {
+                    "running" => ("●", Color::Green),
+                    "pending" => ("◐", Color::Yellow),
+                    "done" if is_active => ("●", Color::Green),
+                    "done" => ("○", Color::DarkGray),
+                    "failed" => ("✕", Color::Red),
+                    _ => ("○", Color::DarkGray),
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {} ", dev_icon), Style::default().fg(dev_color)),
+                    Span::raw(format!("{:<14} ", name)),
+                    Span::styled(state.as_str(), Style::default().fg(dev_color)),
+                ]));
+            }
+        }
+        _ => {
+            lines.push(Line::from(Span::styled(
+                "  (no active recording)",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    let block = Block::default()
+        .title(" Recorder ")
+        .borders(Borders::ALL);
+
+    let paragraph = Paragraph::new(lines).block(block);
     f.render_widget(paragraph, area);
 }

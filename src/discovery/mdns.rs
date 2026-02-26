@@ -4,15 +4,34 @@ use crate::discovery::{DiscoveredDevice, DiscoveryEvent, DiscoverySource};
 use crate::registry::{DeviceEntry, Registry};
 use mdns_sd::{Receiver, ServiceDaemon, ServiceEvent};
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
+
+/// How long a newly-discovered service must remain visible before we report Added.
+const ADD_SETTLE_SECS: u64 = 5;
+
+/// How long after ServiceRemoved before we confirm the device is gone.
+const REMOVAL_GRACE_SECS: u64 = 15;
+
+/// A service that was resolved but not yet confirmed.
+struct PendingAdd {
+    discovered: DiscoveredDevice,
+    first_seen: Instant,
+    /// Set to true when ServiceRemoved arrives during settle; reset on re-Resolved.
+    removed: bool,
+}
 
 pub struct MdnsDiscovery {
     daemon: ServiceDaemon,
-    receivers: Vec<(String, Receiver<ServiceEvent>)>, // (service_type, receiver)
+    receivers: Vec<(String, Receiver<ServiceEvent>)>,
     registry: Registry,
-    /// Map: service fullname -> (device_name, entry, address)
+    /// Confirmed-online services: fullname -> (device_name, entry, address)
     known_services: HashMap<String, (String, DeviceEntry, Option<String>)>,
     /// Tracked service types
     browsed_types: HashSet<String>,
+    /// Services waiting to be confirmed as Added
+    pending_adds: HashMap<String, PendingAdd>,
+    /// Services waiting to be confirmed as Removed
+    pending_removals: HashMap<String, Instant>,
 }
 
 impl MdnsDiscovery {
@@ -24,9 +43,10 @@ impl MdnsDiscovery {
             registry,
             known_services: HashMap::new(),
             browsed_types: HashSet::new(),
+            pending_adds: HashMap::new(),
+            pending_removals: HashMap::new(),
         };
 
-        // Start browsing for each mDNS device entry's service type
         let service_types: Vec<String> = discovery
             .registry
             .devices
@@ -48,14 +68,12 @@ impl MdnsDiscovery {
         discovery
     }
 
-    /// Find a registry entry matching a discovered service type.
     fn find_mdns_match(&self, service_type: &str) -> Option<&DeviceEntry> {
         self.registry.devices.iter().find(|e| {
             if e.backend != "mdns" || e.service_type.is_empty() {
                 return false;
             }
             let entry_st = normalize_service_type(&e.service_type);
-            // Normalize: compare without trailing dot differences
             let norm_entry = entry_st.trim_end_matches('.');
             let norm_discovered = service_type.trim_end_matches('.');
             norm_entry == norm_discovered
@@ -63,7 +81,6 @@ impl MdnsDiscovery {
     }
 }
 
-/// Normalize a service type to end with ".local."
 fn normalize_service_type(st: &str) -> String {
     let mut s = st.to_string();
     if !s.ends_with(".local.") {
@@ -82,63 +99,135 @@ impl DiscoverySource for MdnsDiscovery {
     }
 
     fn enumerate(&mut self) -> Vec<DiscoveredDevice> {
-        // Process any already-received events to populate known_services
-        let _ = self.poll();
-        self.known_services
-            .iter()
-            .map(|(fullname, (device_name, entry, address))| DiscoveredDevice {
-                source_id: fullname.clone(),
-                device_name: device_name.clone(),
-                entry: entry.clone(),
-                address: address.clone(),
-            })
-            .collect()
+        // mDNS initial cache is unreliable; don't enumerate.
+        // Let poll() handle discovery after the settle period.
+        Vec::new()
     }
 
     fn poll(&mut self) -> Vec<DiscoveryEvent> {
         let mut events = Vec::new();
+
+        // 1. Drain mDNS events
         for (_service_type, receiver) in &self.receivers {
             while let Ok(event) = receiver.try_recv() {
                 match event {
                     ServiceEvent::ServiceResolved(info) => {
                         let fullname = info.get_fullname().to_string();
                         let service_type = info.get_type().to_string();
-                        if self.known_services.contains_key(&fullname) {
-                            continue; // Already known
+
+
+                        // Cancel pending removal if service reappears
+                        if self.pending_removals.remove(&fullname).is_some() {
+
+                            continue;
                         }
+
+                        // Already confirmed
+                        if self.known_services.contains_key(&fullname) {
+                            continue;
+                        }
+
+                        // Re-resolved during settle period: mark as alive again
+                        if let Some(pa) = self.pending_adds.get_mut(&fullname) {
+
+                            pa.removed = false;
+                            continue;
+                        }
+
                         if let Some(entry) = self.find_mdns_match(&service_type).cloned() {
-                            // Extract resolved address (IP:port)
+                            let data_port = info
+                                .get_property_val_str("data_port")
+                                .and_then(|v| v.parse::<u16>().ok())
+                                .unwrap_or_else(|| info.get_port());
                             let address = info.get_addresses().iter().next().map(|ip| {
-                                format!("{}:{}", ip, info.get_port())
+                                format!("{}:{}", ip, data_port)
                             });
-                            self.known_services.insert(
+                            self.pending_adds.insert(
                                 fullname.clone(),
-                                (entry.name.clone(), entry.clone(), address.clone()),
+                                PendingAdd {
+                                    discovered: DiscoveredDevice {
+                                        source_id: fullname,
+                                        device_name: entry.name.clone(),
+                                        entry,
+                                        address,
+                                    },
+                                    first_seen: Instant::now(),
+                                    removed: false,
+                                },
                             );
-                            events.push(DiscoveryEvent::Added(DiscoveredDevice {
-                                source_id: fullname,
-                                device_name: entry.name.clone(),
-                                entry,
-                                address,
-                            }));
                         }
                     }
                     ServiceEvent::ServiceRemoved(_, fullname) => {
-                        if self.known_services.remove(&fullname).is_some() {
-                            events.push(DiscoveryEvent::Removed {
-                                source_id: fullname,
-                            });
+
+                        // If pending add, mark as removed (don't delete — may re-resolve)
+                        if let Some(pa) = self.pending_adds.get_mut(&fullname) {
+
+                            pa.removed = true;
+                            continue;
+                        }
+                        // If confirmed, start removal grace period
+                        if self.known_services.contains_key(&fullname) {
+                            self.pending_removals
+                                .entry(fullname)
+                                .or_insert_with(Instant::now);
                         }
                     }
-                    _ => {} // Ignore SearchStarted, SearchStopped, etc.
+                    _ => {}
                 }
             }
         }
+
+        // 2. Check settled pending adds
+        let settle = std::time::Duration::from_secs(ADD_SETTLE_SECS);
+        let mut promoted = Vec::new();
+        let mut discarded = Vec::new();
+        for (fullname, pa) in &self.pending_adds {
+            if pa.first_seen.elapsed() >= settle {
+                if pa.removed {
+                    discarded.push(fullname.clone()); // Stale cache — gone during settle
+                } else {
+                    promoted.push(fullname.clone()); // Still alive — real device
+                }
+            }
+        }
+        for fullname in &discarded {
+
+            self.pending_adds.remove(fullname);
+        }
+        for fullname in promoted {
+            if let Some(pa) = self.pending_adds.remove(&fullname) {
+                let d = &pa.discovered;
+                self.known_services.insert(
+                    fullname,
+                    (d.device_name.clone(), d.entry.clone(), d.address.clone()),
+                );
+                events.push(DiscoveryEvent::Added(pa.discovered));
+            }
+        }
+
+        // 3. Expire pending removals → confirmed + emit Removed
+        let grace = std::time::Duration::from_secs(REMOVAL_GRACE_SECS);
+        let mut expired = Vec::new();
+        for (fullname, since) in &self.pending_removals {
+            if since.elapsed() >= grace {
+                expired.push(fullname.clone());
+            }
+        }
+        for fullname in expired {
+            self.pending_removals.remove(&fullname);
+            if self.known_services.remove(&fullname).is_some() {
+                events.push(DiscoveryEvent::Removed {
+                    source_id: fullname,
+                });
+            }
+        }
+
         events
     }
 
     fn device_still_exists(&self, source_id: &str) -> bool {
         self.known_services.contains_key(source_id)
+            || self.pending_removals.contains_key(source_id)
     }
 
     fn shutdown(&mut self) {

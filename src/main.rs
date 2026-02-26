@@ -153,6 +153,61 @@ fn spawn_engine(
     (handle, engine_thread)
 }
 
+/// Parse port number from a "host:port" bind address string.
+fn parse_port_from_bind(bind: &str) -> Option<u16> {
+    bind.rsplit(':').next()?.parse().ok()
+}
+
+/// Handle for the mDNS advertising subprocess; kills it on drop.
+struct MdnsAdvertiseHandle(std::process::Child);
+
+impl Drop for MdnsAdvertiseHandle {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Advertise the HTTP API via mDNS as `_rapiddriver._tcp`.
+/// Uses the platform's native tool (dns-sd on macOS, avahi on Linux).
+/// Returns a handle — service stays registered as long as this is alive.
+fn advertise_rapiddriver_api(port: u16) -> Option<MdnsAdvertiseHandle> {
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("dns-sd")
+        .arg("-R")
+        .arg("rapid-driver")
+        .arg("_rapiddriver._tcp")
+        .arg(".")
+        .arg(port.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+
+    #[cfg(target_os = "linux")]
+    let result = std::process::Command::new("avahi-publish-service")
+        .args(["rapid-driver", "_rapiddriver._tcp", &port.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let result: Result<std::process::Child, std::io::Error> = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "mDNS advertising not supported on this platform",
+    ));
+
+    match result {
+        Ok(child) => {
+            eprintln!("[mDNS] Advertising _rapiddriver._tcp on port {}", port);
+            Some(MdnsAdvertiseHandle(child))
+        }
+        Err(e) => {
+            eprintln!("[mDNS] Failed to advertise _rapiddriver._tcp: {}", e);
+            None
+        }
+    }
+}
+
 fn cmd_monitor(mask_enabled: bool, api_bind: Option<String>) {
     let reg = match registry::load_registry() {
         Ok(r) => r,
@@ -168,9 +223,10 @@ fn cmd_monitor(mask_enabled: bool, api_bind: Option<String>) {
 
     let (handle, engine_thread) = spawn_engine(reg, mask_enabled);
 
-    // Optionally spawn API server thread
-    if let Some(bind) = api_bind {
+    // Optionally spawn API server thread + advertise via mDNS
+    let _mdns_daemon = if let Some(ref bind) = api_bind {
         let api_handle = handle.clone();
+        let bind_clone = bind.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -178,17 +234,20 @@ fn cmd_monitor(mask_enabled: bool, api_bind: Option<String>) {
                 .expect("failed to build tokio runtime");
             rt.block_on(async {
                 let app = api::build_router(api_handle);
-                let listener = tokio::net::TcpListener::bind(&bind)
+                let listener = tokio::net::TcpListener::bind(&bind_clone)
                     .await
                     .unwrap_or_else(|e| {
-                        eprintln!("Failed to bind API to {}: {}", bind, e);
+                        eprintln!("Failed to bind API to {}: {}", bind_clone, e);
                         std::process::exit(1);
                     });
-                eprintln!("API server listening on {}", bind);
+                eprintln!("API server listening on {}", bind_clone);
                 axum::serve(listener, app).await.unwrap();
             });
         });
-    }
+        parse_port_from_bind(bind).and_then(advertise_rapiddriver_api)
+    } else {
+        None
+    };
 
     // Run TUI on main thread
     if let Err(e) = tui::run_tui(handle.clone(), mask_enabled) {
@@ -214,6 +273,9 @@ fn cmd_serve(bind: &str, mask_enabled: bool) {
     }
 
     let (handle, engine_thread) = spawn_engine(reg, mask_enabled);
+
+    // Advertise API via mDNS
+    let _mdns_daemon = parse_port_from_bind(bind).and_then(advertise_rapiddriver_api);
 
     // Run API server on main thread
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -340,6 +402,13 @@ fn register_mdns_device(
         _ => String::new(),
     };
 
+    print!("Sensor type for MCAP recording (motor/video/gopro, or empty to skip): ");
+    io::stdout().flush().unwrap();
+    let sensor_type = match lines.next() {
+        Some(Ok(line)) => line.trim().to_string(),
+        _ => String::new(),
+    };
+
     let entry = DeviceEntry {
         name: name.clone(),
         backend: "mdns".to_string(),
@@ -351,6 +420,7 @@ fn register_mdns_device(
         on_detach,
         on_record_start,
         on_record_stop,
+        sensor_type,
     };
 
     println!("\nRegistering: {:?}", entry);
@@ -485,6 +555,7 @@ fn register_usb_device(
         on_detach,
         on_record_start: String::new(),
         on_record_stop: String::new(),
+        sensor_type: String::new(),
     };
 
     println!("\nRegistering: {:?}", entry);
@@ -537,10 +608,10 @@ fn cmd_list() {
     }
 
     println!(
-        "{:<20} {:<8} {:<10} {:<20} {:<30} {}",
-        "NAME", "BACKEND", "VID:PID", "SERVICE_TYPE", "ON_ATTACH", "ON_DETACH"
+        "{:<20} {:<8} {:<10} {:<20} {:<8} {:<30} {}",
+        "NAME", "BACKEND", "VID:PID", "SERVICE_TYPE", "SENSOR", "ON_ATTACH", "ON_DETACH"
     );
-    println!("{}", "-".repeat(110));
+    println!("{}", "-".repeat(120));
 
     for entry in &reg.devices {
         let vid_pid = if entry.vid.is_empty() && entry.pid.is_empty() {
@@ -553,14 +624,19 @@ fn cmd_list() {
         } else {
             &entry.service_type
         };
+        let sensor = if entry.sensor_type.is_empty() {
+            "-"
+        } else {
+            &entry.sensor_type
+        };
         let on_detach = if entry.on_detach.is_empty() {
             "(none)"
         } else {
             &entry.on_detach
         };
         println!(
-            "{:<20} {:<8} {:<10} {:<20} {:<30} {}",
-            entry.name, entry.backend, vid_pid, service_type, entry.on_attach, on_detach
+            "{:<20} {:<8} {:<10} {:<20} {:<8} {:<30} {}",
+            entry.name, entry.backend, vid_pid, service_type, sensor, entry.on_attach, on_detach
         );
     }
 }

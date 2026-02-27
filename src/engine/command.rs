@@ -3,25 +3,31 @@
 use std::collections::HashMap;
 use std::sync::mpsc::{self, SyncSender};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::registry::{DeviceEntry, Registry};
 
 /// Status of a single device.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceStatus {
     pub name: String,
     pub bit_index: usize,
-    pub online: bool,
+    pub discovered: bool,
     pub process_running: bool,
     pub pid: Option<u32>,
     pub backend: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heartbeat_ok: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_heartbeat_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
 }
 
 /// Full engine status snapshot.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineStatus {
     pub devices: Vec<DeviceStatus>,
     pub current_mask: u64,
@@ -33,7 +39,7 @@ pub struct EngineStatus {
 }
 
 /// Recording session info (serializable).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordingInfo {
     pub session_id: String,
     pub state: String,
@@ -50,13 +56,25 @@ pub struct RecordingInfo {
 pub enum EngineCommand {
     GetStatus,
     GetDevices,
-    GetDevice { name: String },
-    RestartDevice { name: String },
-    StopDevice { name: String },
-    StartDevice { name: String },
+    GetDevice {
+        name: String,
+    },
+    RestartDevice {
+        name: String,
+    },
+    StopDevice {
+        name: String,
+    },
+    StartDevice {
+        name: String,
+    },
     GetRegistry,
-    AddDevice { entry: DeviceEntry },
-    RemoveDevice { name: String },
+    AddDevice {
+        entry: DeviceEntry,
+    },
+    RemoveDevice {
+        name: String,
+    },
     GetMask,
     StartRecording {
         session_id: Option<String>,
@@ -68,10 +86,17 @@ pub enum EngineCommand {
     },
     GetRecordingStatus,
     /// Layout operations
-    MoveDevice { from: usize, to: usize },
+    MoveDevice {
+        from: usize,
+        to: usize,
+    },
     SaveLayout,
-    ExportLayout { path: String },
-    ImportLayout { path: String },
+    ExportLayout {
+        path: String,
+    },
+    ImportLayout {
+        path: String,
+    },
     /// Graceful shutdown.
     Shutdown,
 }

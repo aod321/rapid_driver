@@ -4,17 +4,13 @@ use std::sync::mpsc::Sender;
 
 use zeromq::{Socket, SocketRecv, SubSocket};
 
-use super::messages::{msgpack_to_sensor_message, SensorMessage};
+use super::messages::{SensorMessage, msgpack_to_sensor_message};
 
 /// Spawn an async ZMQ SUB task that connects to a sensor's PUB socket,
 /// decodes msgpack messages, and sends them through the channel.
 ///
 /// This task runs until cancelled via `JoinHandle::abort()`.
-pub async fn zmq_subscribe_task(
-    address: String,
-    source_name: String,
-    tx: Sender<SensorMessage>,
-) {
+pub async fn zmq_subscribe_task(address: String, source_name: String, tx: Sender<SensorMessage>) {
     let mut socket = SubSocket::new();
     socket.subscribe("").await.unwrap_or_else(|e| {
         eprintln!("[recorder] {}: subscribe error: {}", source_name, e);
@@ -22,7 +18,10 @@ pub async fn zmq_subscribe_task(
 
     let endpoint = format!("tcp://{}", address);
     if let Err(e) = socket.connect(&endpoint).await {
-        eprintln!("[recorder] {}: connect to {} failed: {}", source_name, endpoint, e);
+        eprintln!(
+            "[recorder] {}: connect to {} failed: {}",
+            source_name, endpoint, e
+        );
         return;
     }
     eprintln!("[recorder] {}: connected to {}", source_name, endpoint);
@@ -30,7 +29,8 @@ pub async fn zmq_subscribe_task(
     loop {
         match socket.recv().await {
             Ok(msg) => {
-                let raw: Vec<u8> = msg.into_vec()
+                let raw: Vec<u8> = msg
+                    .into_vec()
                     .into_iter()
                     .flat_map(|frame| frame.to_vec())
                     .collect();

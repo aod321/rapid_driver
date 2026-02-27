@@ -126,8 +126,7 @@ impl RecorderCore {
             }
         }
 
-        let session = self.active.take()
-            .ok_or("no active MCAP recording")?;
+        let session = self.active.take().ok_or("no active MCAP recording")?;
 
         let message_count = session.message_count;
         let duration_secs = session.started_at.elapsed().as_secs_f64();
@@ -137,7 +136,10 @@ impl RecorderCore {
 
         eprintln!(
             "[recorder] stopped session '{}': {} messages in {:.1}s → {}",
-            session_id, message_count, duration_secs, output_path.display(),
+            session_id,
+            message_count,
+            duration_secs,
+            output_path.display(),
         );
 
         Ok(RecordingSummary {

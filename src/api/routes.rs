@@ -1,5 +1,7 @@
 //! HTTP handler functions.
 
+use std::collections::HashMap;
+
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -26,6 +28,10 @@ pub fn router() -> Router<EngineHandle> {
         .route("/recording/start", post(start_recording))
         .route("/recording/stop", post(stop_recording))
         .route("/recording/status", get(get_recording_status))
+        .route("/layout/move", post(move_layout))
+        .route("/layout/save", post(save_layout))
+        .route("/layout/export", post(export_layout))
+        .route("/layout/import", post(import_layout))
         .route("/shutdown", post(shutdown))
 }
 
@@ -178,11 +184,9 @@ async fn remove_device(
 ) -> impl IntoResponse {
     match engine_request(handle, EngineCommand::RemoveDevice { name }).await {
         Ok(EngineResponse::Ok) => Json(serde_json::json!({"ok": true})).into_response(),
-        Ok(EngineResponse::Error(e)) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": e})),
-        )
-            .into_response(),
+        Ok(EngineResponse::Error(e)) => {
+            (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": e}))).into_response()
+        }
         _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -194,13 +198,27 @@ async fn get_ready(State(handle): State<EngineHandle>) -> impl IntoResponse {
             let online = status
                 .devices
                 .iter()
-                .filter(|d| d.online && d.process_running)
+                .filter(|d| d.process_running && d.heartbeat_ok.unwrap_or(true))
                 .count();
+            let mut reasons: HashMap<String, String> = HashMap::new();
+            for device in &status.devices {
+                let available = device.process_running && device.heartbeat_ok.unwrap_or(true);
+                if !available {
+                    reasons.insert(
+                        device.name.clone(),
+                        device
+                            .state_reason
+                            .clone()
+                            .unwrap_or_else(|| "unavailable".to_string()),
+                    );
+                }
+            }
             let ready = total > 0 && online == total;
             Json(serde_json::json!({
                 "ready": ready,
                 "online": online,
                 "total": total,
+                "reasons": reasons,
             }))
             .into_response()
         }
@@ -210,14 +228,88 @@ async fn get_ready(State(handle): State<EngineHandle>) -> impl IntoResponse {
 
 async fn get_mask(State(handle): State<EngineHandle>) -> impl IntoResponse {
     match engine_request(handle, EngineCommand::GetMask).await {
-        Ok(EngineResponse::Mask { value, hex, layout }) => {
-            Json(serde_json::json!({
-                "value": value,
-                "hex": hex,
-                "layout": layout,
-            }))
-            .into_response()
-        }
+        Ok(EngineResponse::Mask { value, hex, layout }) => Json(serde_json::json!({
+            "value": value,
+            "hex": hex,
+            "layout": layout,
+        }))
+        .into_response(),
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct MoveLayoutRequest {
+    from: usize,
+    to: usize,
+}
+
+async fn move_layout(
+    State(handle): State<EngineHandle>,
+    Json(req): Json<MoveLayoutRequest>,
+) -> impl IntoResponse {
+    match engine_request(
+        handle,
+        EngineCommand::MoveDevice {
+            from: req.from,
+            to: req.to,
+        },
+    )
+    .await
+    {
+        Ok(EngineResponse::Ok) => Json(serde_json::json!({"ok": true})).into_response(),
+        Ok(EngineResponse::Error(e)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn save_layout(State(handle): State<EngineHandle>) -> impl IntoResponse {
+    match engine_request(handle, EngineCommand::SaveLayout).await {
+        Ok(EngineResponse::Ok) => Json(serde_json::json!({"ok": true})).into_response(),
+        Ok(EngineResponse::Error(e)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct LayoutPathRequest {
+    path: String,
+}
+
+async fn export_layout(
+    State(handle): State<EngineHandle>,
+    Json(req): Json<LayoutPathRequest>,
+) -> impl IntoResponse {
+    match engine_request(handle, EngineCommand::ExportLayout { path: req.path }).await {
+        Ok(EngineResponse::Ok) => Json(serde_json::json!({"ok": true})).into_response(),
+        Ok(EngineResponse::Error(e)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn import_layout(
+    State(handle): State<EngineHandle>,
+    Json(req): Json<LayoutPathRequest>,
+) -> impl IntoResponse {
+    match engine_request(handle, EngineCommand::ImportLayout { path: req.path }).await {
+        Ok(EngineResponse::Ok) => Json(serde_json::json!({"ok": true})).into_response(),
+        Ok(EngineResponse::Error(e)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
         _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }

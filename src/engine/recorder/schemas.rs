@@ -2,7 +2,9 @@
 
 /// Returns (schema_name, json_schema_string) for motor state messages.
 pub fn motor_schema() -> (&'static str, &'static str) {
-    ("zumi.MotorState", r#"{
+    (
+        "zumi.MotorState",
+        r#"{
   "type": "object",
   "properties": {
     "type": {"type": "string"},
@@ -14,12 +16,15 @@ pub fn motor_schema() -> (&'static str, &'static str) {
     "enabled": {"type": "array", "items": {"type": "boolean"}},
     "fault": {"type": "array", "items": {"type": "integer"}}
   }
-}"#)
+}"#,
+    )
 }
 
 /// Returns (schema_name, json_schema_string) for video packet messages.
 pub fn video_schema() -> (&'static str, &'static str) {
-    ("zumi.VideoPacket", r#"{
+    (
+        "zumi.VideoPacket",
+        r#"{
   "type": "object",
   "properties": {
     "type": {"type": "string"},
@@ -32,12 +37,15 @@ pub fn video_schema() -> (&'static str, &'static str) {
     "frame_index": {"type": "integer"},
     "pts": {"type": "number"}
   }
-}"#)
+}"#,
+    )
 }
 
 /// Returns (schema_name, json_schema_string) for image packet messages.
 pub fn image_schema() -> (&'static str, &'static str) {
-    ("foxglove.CompressedImage", r#"{
+    (
+        "foxglove.CompressedImage",
+        r#"{
   "type": "object",
   "properties": {
     "timestamp": {
@@ -53,12 +61,15 @@ pub fn image_schema() -> (&'static str, &'static str) {
     "data": {"type": "string", "contentEncoding": "base64"}
   },
   "required": ["timestamp", "frame_id", "format", "data"]
-}"#)
+}"#,
+    )
 }
 
 /// Returns (schema_name, json_schema_string) for iPhone pose messages.
 pub fn iphone_pose_schema() -> (&'static str, &'static str) {
-    ("foxglove.PoseInFrame", r#"{
+    (
+        "foxglove.PoseInFrame",
+        r#"{
   "type": "object",
   "properties": {
     "timestamp": {
@@ -97,12 +108,15 @@ pub fn iphone_pose_schema() -> (&'static str, &'static str) {
     }
   },
   "required": ["timestamp", "frame_id", "pose"]
-}"#)
+}"#,
+    )
 }
 
 /// Returns (schema_name, json_schema_string) for GoPro metadata messages.
 pub fn gopro_meta_schema() -> (&'static str, &'static str) {
-    ("zumi.GoProMetadata", r#"{
+    (
+        "zumi.GoProMetadata",
+        r#"{
   "type": "object",
   "properties": {
     "type": {"type": "string"},
@@ -111,12 +125,15 @@ pub fn gopro_meta_schema() -> (&'static str, &'static str) {
     "episode": {"type": "integer"},
     "session_id": {"type": "string"}
   }
-}"#)
+}"#,
+    )
 }
 
 /// Returns (schema_name, json_schema_string) for hardware mask messages.
 pub fn hardware_mask_schema() -> (&'static str, &'static str) {
-    ("zumi.HardwareMask", r#"{
+    (
+        "zumi.HardwareMask",
+        r#"{
   "type": "object",
   "properties": {
     "type": {"type": "string"},
@@ -126,7 +143,8 @@ pub fn hardware_mask_schema() -> (&'static str, &'static str) {
     "device_count": {"type": "integer"},
     "devices": {"type": "object", "additionalProperties": {"type": "boolean"}}
   }
-}"#)
+}"#,
+    )
 }
 
 /// Map a message type string to its (schema_name, topic_suffix).
@@ -179,7 +197,10 @@ mod tests {
         let has_image = all_schemas()
             .iter()
             .any(|(name, _)| *name == "foxglove.CompressedImage");
-        assert!(has_image, "missing foxglove.CompressedImage schema registration");
+        assert!(
+            has_image,
+            "missing foxglove.CompressedImage schema registration"
+        );
     }
 
     #[test]

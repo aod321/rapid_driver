@@ -2,9 +2,9 @@
 //!
 //! Provides a unified interface for different device discovery backends (USB, mDNS, etc).
 
+pub mod mdns;
 #[cfg(target_os = "linux")]
 pub mod usb;
-pub mod mdns;
 
 use crate::registry::DeviceEntry;
 

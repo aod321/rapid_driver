@@ -7,10 +7,10 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 /// How long a newly-discovered service must remain visible before we report Added.
-const ADD_SETTLE_SECS: u64 = 5;
+const ADD_SETTLE_SECS: u64 = 2;
 
 /// How long after ServiceRemoved before we confirm the device is gone.
-const REMOVAL_GRACE_SECS: u64 = 15;
+const REMOVAL_GRACE_SECS: u64 = 5;
 
 /// A service that was resolved but not yet confirmed.
 struct PendingAdd {
@@ -115,10 +115,8 @@ impl DiscoverySource for MdnsDiscovery {
                         let fullname = info.get_fullname().to_string();
                         let service_type = info.get_type().to_string();
 
-
                         // Cancel pending removal if service reappears
                         if self.pending_removals.remove(&fullname).is_some() {
-
                             continue;
                         }
 
@@ -129,7 +127,6 @@ impl DiscoverySource for MdnsDiscovery {
 
                         // Re-resolved during settle period: mark as alive again
                         if let Some(pa) = self.pending_adds.get_mut(&fullname) {
-
                             pa.removed = false;
                             continue;
                         }
@@ -139,9 +136,11 @@ impl DiscoverySource for MdnsDiscovery {
                                 .get_property_val_str("data_port")
                                 .and_then(|v| v.parse::<u16>().ok())
                                 .unwrap_or_else(|| info.get_port());
-                            let address = info.get_addresses().iter().next().map(|ip| {
-                                format!("{}:{}", ip, data_port)
-                            });
+                            let address = info
+                                .get_addresses()
+                                .iter()
+                                .next()
+                                .map(|ip| format!("{}:{}", ip, data_port));
                             self.pending_adds.insert(
                                 fullname.clone(),
                                 PendingAdd {
@@ -158,10 +157,8 @@ impl DiscoverySource for MdnsDiscovery {
                         }
                     }
                     ServiceEvent::ServiceRemoved(_, fullname) => {
-
                         // If pending add, mark as removed (don't delete — may re-resolve)
                         if let Some(pa) = self.pending_adds.get_mut(&fullname) {
-
                             pa.removed = true;
                             continue;
                         }
@@ -191,7 +188,6 @@ impl DiscoverySource for MdnsDiscovery {
             }
         }
         for fullname in &discarded {
-
             self.pending_adds.remove(fullname);
         }
         for fullname in promoted {
@@ -226,8 +222,7 @@ impl DiscoverySource for MdnsDiscovery {
     }
 
     fn device_still_exists(&self, source_id: &str) -> bool {
-        self.known_services.contains_key(source_id)
-            || self.pending_removals.contains_key(source_id)
+        self.known_services.contains_key(source_id) || self.pending_removals.contains_key(source_id)
     }
 
     fn shutdown(&mut self) {

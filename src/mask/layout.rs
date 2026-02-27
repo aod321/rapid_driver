@@ -68,8 +68,7 @@ impl MaskLayout {
         }
         let content = fs::read_to_string(&path)
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-        toml::from_str(&content)
-            .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))
+        toml::from_str(&content).map_err(|e| format!("Failed to parse {}: {}", path.display(), e))
     }
 
     /// Save layout to the config file.
@@ -78,22 +77,22 @@ impl MaskLayout {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let content = toml::to_string_pretty(self)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let content =
+            toml::to_string_pretty(self).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         fs::write(&path, content)
     }
 
     /// Export layout to a custom path.
     pub fn export<P: AsRef<std::path::Path>>(&self, path: P) -> io::Result<()> {
-        let content = toml::to_string_pretty(self)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let content =
+            toml::to_string_pretty(self).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         fs::write(path, content)
     }
 
     /// Import layout from a custom path.
     pub fn import<P: AsRef<std::path::Path>>(path: P) -> Result<Self, String> {
-        let content = fs::read_to_string(path.as_ref())
-            .map_err(|e| format!("Failed to read file: {}", e))?;
+        let content =
+            fs::read_to_string(path.as_ref()).map_err(|e| format!("Failed to read file: {}", e))?;
         toml::from_str(&content).map_err(|e| format!("Failed to parse: {}", e))
     }
 

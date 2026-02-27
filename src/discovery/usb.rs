@@ -46,7 +46,9 @@ impl DiscoverySource for UsbDiscovery {
     fn enumerate(&mut self) -> Vec<DiscoveredDevice> {
         let mut found = Vec::new();
         let mut enumerator = udev::Enumerator::new().expect("failed to create enumerator");
-        enumerator.match_subsystem("usb").expect("failed to match subsystem");
+        enumerator
+            .match_subsystem("usb")
+            .expect("failed to match subsystem");
 
         let devices = enumerator.scan_devices().expect("failed to scan devices");
         for device in devices {
@@ -56,7 +58,8 @@ impl DiscoverySource for UsbDiscovery {
             }
             if let Some(identity) = registry::extract_identity(&device) {
                 if let Some(entry) = registry::find_match(&self.registry, &identity).cloned() {
-                    self.known_devices.insert(identity.sysname.clone(), entry.name.clone());
+                    self.known_devices
+                        .insert(identity.sysname.clone(), entry.name.clone());
                     found.push(DiscoveredDevice {
                         source_id: identity.sysname,
                         device_name: entry.name.clone(),
@@ -73,8 +76,8 @@ impl DiscoverySource for UsbDiscovery {
         let mut events = Vec::new();
 
         // Non-blocking: iterate available events
-        use std::os::unix::io::AsFd;
         use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+        use std::os::unix::io::AsFd;
 
         let fd = self.monitor.as_fd();
         let mut poll_fds = [PollFd::new(fd, PollFlags::POLLIN)];
@@ -101,8 +104,11 @@ impl DiscoverySource for UsbDiscovery {
                                 self.cooldown.remove(&sysname);
                             }
                             if let Some(identity) = registry::extract_identity(&device) {
-                                if let Some(entry) = registry::find_match(&self.registry, &identity).cloned() {
-                                    self.known_devices.insert(identity.sysname.clone(), entry.name.clone());
+                                if let Some(entry) =
+                                    registry::find_match(&self.registry, &identity).cloned()
+                                {
+                                    self.known_devices
+                                        .insert(identity.sysname.clone(), entry.name.clone());
                                     events.push(DiscoveryEvent::Added(DiscoveredDevice {
                                         source_id: identity.sysname,
                                         device_name: entry.name.clone(),

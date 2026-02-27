@@ -6,9 +6,9 @@ use std::io::BufWriter;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use mcap::Compression;
 use mcap::records::MessageHeader;
 use mcap::write::{WriteOptions, Writer};
-use mcap::Compression;
 
 use super::messages::SensorMessage;
 use super::schemas;
@@ -16,13 +16,13 @@ use super::schemas;
 /// An active MCAP recording session.
 pub struct McapSession {
     writer: Writer<BufWriter<File>>,
-    schema_ids: HashMap<String, u16>,   // schema_name -> schema_id
-    channel_ids: HashMap<String, u16>,  // topic -> channel_id
+    schema_ids: HashMap<String, u16>,  // schema_name -> schema_id
+    channel_ids: HashMap<String, u16>, // topic -> channel_id
     pub session_id: String,
     pub output_path: PathBuf,
     pub message_count: u64,
     pub started_at: Instant,
-    sequences: HashMap<u16, u32>,       // channel_id -> sequence counter
+    sequences: HashMap<u16, u32>, // channel_id -> sequence counter
     unknown_types_warned: HashSet<String>,
 }
 
@@ -30,12 +30,10 @@ impl McapSession {
     /// Create a new MCAP session, creating the output directory and file.
     pub fn new(session_id: &str, output_dir: &str) -> Result<Self, String> {
         let output_dir = PathBuf::from(output_dir);
-        fs::create_dir_all(&output_dir)
-            .map_err(|e| format!("create output dir: {}", e))?;
+        fs::create_dir_all(&output_dir).map_err(|e| format!("create output dir: {}", e))?;
 
         let output_path = output_dir.join(format!("{}.mcap", session_id));
-        let file = File::create(&output_path)
-            .map_err(|e| format!("create mcap file: {}", e))?;
+        let file = File::create(&output_path).map_err(|e| format!("create mcap file: {}", e))?;
         let buf = BufWriter::new(file);
 
         let writer = WriteOptions::new()
@@ -60,7 +58,8 @@ impl McapSession {
     /// Register all known schemas with the MCAP writer.
     pub fn register_schemas(&mut self) -> Result<(), String> {
         for (name, json_schema) in schemas::all_schemas() {
-            let schema_id = self.writer
+            let schema_id = self
+                .writer
                 .add_schema(name, "jsonschema", json_schema.as_bytes())
                 .map_err(|e| format!("add schema '{}': {}", name, e))?;
             self.schema_ids.insert(name.to_string(), schema_id);
@@ -75,12 +74,15 @@ impl McapSession {
             return Ok(id);
         }
 
-        let schema_id = self.schema_ids.get(schema_name)
+        let schema_id = self
+            .schema_ids
+            .get(schema_name)
             .copied()
             .ok_or_else(|| format!("unknown schema: {}", schema_name))?;
 
         let metadata = BTreeMap::new();
-        let channel_id = self.writer
+        let channel_id = self
+            .writer
             .add_channel(schema_id, topic, "json", &metadata)
             .map_err(|e| format!("add channel '{}': {}", topic, e))?;
 
@@ -91,7 +93,8 @@ impl McapSession {
     /// Write a sensor message to the MCAP file.
     /// Determines the topic from source_name + msg_type, creates channels lazily.
     pub fn write_message(&mut self, msg: &SensorMessage) -> Result<(), String> {
-        let Some((schema_name, suffix)) = schemas::msg_type_to_schema_and_suffix(&msg.msg_type) else {
+        let Some((schema_name, suffix)) = schemas::msg_type_to_schema_and_suffix(&msg.msg_type)
+        else {
             if self.unknown_types_warned.insert(msg.msg_type.clone()) {
                 eprintln!(
                     "[recorder] skipping unknown msg type '{}' from '{}'",
@@ -149,7 +152,8 @@ impl McapSession {
     /// Finish writing the MCAP file and return the output path.
     pub fn finish(mut self) -> Result<PathBuf, String> {
         let path = self.output_path.clone();
-        self.writer.finish()
+        self.writer
+            .finish()
             .map_err(|e| format!("finish mcap: {}", e))?;
         Ok(path)
     }

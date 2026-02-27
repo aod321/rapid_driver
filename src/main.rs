@@ -8,16 +8,23 @@ mod tui;
 mod udev_rule;
 
 use clap::{Parser, Subcommand};
-use engine::command::{EngineCommand, EngineHandle};
 use engine::Engine;
+use engine::command::{EngineCommand, EngineHandle, EngineResponse};
 use mask::MaskLayout;
 use registry::DeviceEntry;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::time::Duration;
 
 #[derive(Parser)]
-#[command(name = "rapid_driver", about = "Device-triggered process manager", infer_subcommands = true)]
+#[command(
+    name = "rapid_driver",
+    about = "Device-triggered process manager",
+    infer_subcommands = true
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -34,6 +41,9 @@ enum Commands {
         /// Enable HTTP API server (e.g. --api 0.0.0.0:7400)
         #[arg(long)]
         api: Option<String>,
+        /// Connect TUI to an existing daemon API (e.g. --connect http://127.0.0.1:7400)
+        #[arg(long)]
+        connect: Option<String>,
     },
     /// Headless daemon with HTTP API server
     #[command(visible_alias = "srv")]
@@ -94,11 +104,16 @@ enum MaskLayoutAction {
 fn main() {
     let cli = Cli::parse();
 
-    match cli
-        .command
-        .unwrap_or(Commands::Monitor { no_mask: false, api: None })
-    {
-        Commands::Monitor { no_mask, api } => cmd_monitor(!no_mask, api),
+    match cli.command.unwrap_or(Commands::Monitor {
+        no_mask: false,
+        api: None,
+        connect: None,
+    }) {
+        Commands::Monitor {
+            no_mask,
+            api,
+            connect,
+        } => cmd_monitor(!no_mask, api, connect),
         Commands::Serve { bind, no_mask } => cmd_serve(&bind, !no_mask),
         Commands::Register => cmd_register(),
         Commands::List => cmd_list(),
@@ -208,7 +223,266 @@ fn advertise_rapiddriver_api(port: u16) -> Option<MdnsAdvertiseHandle> {
     }
 }
 
-fn cmd_monitor(mask_enabled: bool, api_bind: Option<String>) {
+#[derive(serde::Deserialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+#[derive(serde::Deserialize)]
+struct MaskResponse {
+    value: u64,
+    hex: String,
+    layout: Vec<String>,
+}
+
+struct HttpEngineProxy {
+    base_url: String,
+    http: ureq::Agent,
+}
+
+impl HttpEngineProxy {
+    fn new(remote_api: &str) -> Self {
+        let base_url = normalize_api_base(remote_api);
+        let http = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(2))
+            .timeout_read(Duration::from_secs(5))
+            .timeout_write(Duration::from_secs(5))
+            .build();
+        Self { base_url, http }
+    }
+
+    fn execute(&self, cmd: EngineCommand) -> EngineResponse {
+        match cmd {
+            EngineCommand::GetStatus => match self.get_json("/status") {
+                Ok(status) => EngineResponse::Status(status),
+                Err(e) => EngineResponse::Error(e),
+            },
+            EngineCommand::GetDevices => match self.get_json("/devices") {
+                Ok(devices) => EngineResponse::Devices(devices),
+                Err(e) => EngineResponse::Error(e),
+            },
+            EngineCommand::GetDevice { name } => self.get_device(&name),
+            EngineCommand::RestartDevice { name } => {
+                self.run_ok_post(&format!("/devices/{name}/restart"))
+            }
+            EngineCommand::StopDevice { name } => {
+                self.run_ok_post(&format!("/devices/{name}/stop"))
+            }
+            EngineCommand::StartDevice { name } => {
+                self.run_ok_post(&format!("/devices/{name}/start"))
+            }
+            EngineCommand::GetRegistry => match self.get_json("/registry") {
+                Ok(reg) => EngineResponse::Registry(reg),
+                Err(e) => EngineResponse::Error(e),
+            },
+            EngineCommand::AddDevice { entry } => self.run_ok_post_json("/registry", &entry),
+            EngineCommand::RemoveDevice { name } => {
+                self.run_ok_delete(&format!("/registry/{name}"))
+            }
+            EngineCommand::GetMask => match self.get_json::<MaskResponse>("/mask") {
+                Ok(mask) => EngineResponse::Mask {
+                    value: mask.value,
+                    hex: mask.hex,
+                    layout: mask.layout,
+                },
+                Err(e) => EngineResponse::Error(e),
+            },
+            EngineCommand::StartRecording {
+                session_id,
+                devices,
+                output_dir,
+            } => {
+                let payload = serde_json::json!({
+                    "session_id": session_id,
+                    "devices": devices,
+                    "output_dir": output_dir,
+                });
+                self.run_ok_post_json("/recording/start", &payload)
+            }
+            EngineCommand::StopRecording { session_id } => {
+                let payload = serde_json::json!({
+                    "session_id": session_id,
+                });
+                self.run_ok_post_json("/recording/stop", &payload)
+            }
+            EngineCommand::GetRecordingStatus => match self.get_json("/recording/status") {
+                Ok(rec) => EngineResponse::RecordingStatus(rec),
+                Err(e) => EngineResponse::Error(e),
+            },
+            EngineCommand::MoveDevice { from, to } => {
+                let payload = serde_json::json!({ "from": from, "to": to });
+                self.run_ok_post_json("/layout/move", &payload)
+            }
+            EngineCommand::SaveLayout => self.run_ok_post("/layout/save"),
+            EngineCommand::ExportLayout { path } => {
+                let payload = serde_json::json!({ "path": path });
+                self.run_ok_post_json("/layout/export", &payload)
+            }
+            EngineCommand::ImportLayout { path } => {
+                let payload = serde_json::json!({ "path": path });
+                self.run_ok_post_json("/layout/import", &payload)
+            }
+            EngineCommand::Shutdown => EngineResponse::Ok,
+        }
+    }
+
+    fn get_device(&self, name: &str) -> EngineResponse {
+        let url = self.url(&format!("/devices/{name}"));
+        match self.http.get(&url).call() {
+            Ok(resp) => match resp.into_json::<engine::command::DeviceStatus>() {
+                Ok(device) => EngineResponse::Device(Some(device)),
+                Err(e) => EngineResponse::Error(format!("decode /devices/{name}: {e}")),
+            },
+            Err(ureq::Error::Status(404, _)) => EngineResponse::Device(None),
+            Err(ureq::Error::Status(code, resp)) => {
+                let msg = self
+                    .decode_error_response(resp)
+                    .unwrap_or_else(|_| format!("HTTP {code}"));
+                EngineResponse::Error(msg)
+            }
+            Err(ureq::Error::Transport(e)) => {
+                EngineResponse::Error(format!("transport error: {e}"))
+            }
+        }
+    }
+
+    fn run_ok_post(&self, path: &str) -> EngineResponse {
+        match self.post_empty(path) {
+            Ok(_) => EngineResponse::Ok,
+            Err(e) => EngineResponse::Error(e),
+        }
+    }
+
+    fn run_ok_post_json<T: Serialize>(&self, path: &str, payload: &T) -> EngineResponse {
+        match self.post_json_value(path, payload) {
+            Ok(_) => EngineResponse::Ok,
+            Err(e) => EngineResponse::Error(e),
+        }
+    }
+
+    fn run_ok_delete(&self, path: &str) -> EngineResponse {
+        match self.delete(path) {
+            Ok(_) => EngineResponse::Ok,
+            Err(e) => EngineResponse::Error(e),
+        }
+    }
+
+    fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, String> {
+        let url = self.url(path);
+        let resp = self
+            .http
+            .get(&url)
+            .call()
+            .map_err(|e| self.map_ureq_error(e))?;
+        resp.into_json::<T>()
+            .map_err(|e| format!("decode {path}: {e}"))
+    }
+
+    fn post_empty(&self, path: &str) -> Result<serde_json::Value, String> {
+        let url = self.url(path);
+        let resp = self
+            .http
+            .post(&url)
+            .call()
+            .map_err(|e| self.map_ureq_error(e))?;
+        resp.into_json::<serde_json::Value>()
+            .map_err(|e| format!("decode {path}: {e}"))
+    }
+
+    fn post_json_value<T: Serialize>(
+        &self,
+        path: &str,
+        payload: &T,
+    ) -> Result<serde_json::Value, String> {
+        let url = self.url(path);
+        let resp = self
+            .http
+            .post(&url)
+            .send_json(payload)
+            .map_err(|e| self.map_ureq_error(e))?;
+        resp.into_json::<serde_json::Value>()
+            .map_err(|e| format!("decode {path}: {e}"))
+    }
+
+    fn delete(&self, path: &str) -> Result<serde_json::Value, String> {
+        let url = self.url(path);
+        let resp = self
+            .http
+            .delete(&url)
+            .call()
+            .map_err(|e| self.map_ureq_error(e))?;
+        resp.into_json::<serde_json::Value>()
+            .map_err(|e| format!("decode {path}: {e}"))
+    }
+
+    fn map_ureq_error(&self, err: ureq::Error) -> String {
+        match err {
+            ureq::Error::Status(code, resp) => self
+                .decode_error_response(resp)
+                .unwrap_or_else(|_| format!("HTTP {code}")),
+            ureq::Error::Transport(e) => format!("transport error: {e}"),
+        }
+    }
+
+    fn decode_error_response(&self, resp: ureq::Response) -> Result<String, String> {
+        let code = resp.status();
+        match resp.into_json::<ErrorResponse>() {
+            Ok(error) => Ok(error.error),
+            Err(_) => Err(format!("HTTP {code}")),
+        }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{}", self.base_url, path)
+    }
+}
+
+fn normalize_api_base(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    }
+}
+
+fn spawn_http_proxy_handle(remote_api: &str) -> EngineHandle {
+    type ProxyMsg = (EngineCommand, Option<mpsc::SyncSender<EngineResponse>>);
+    let (cmd_tx, cmd_rx) = mpsc::sync_channel::<ProxyMsg>(64);
+    let handle = EngineHandle::new(cmd_tx);
+    let remote = remote_api.to_string();
+
+    std::thread::spawn(move || {
+        let proxy = HttpEngineProxy::new(&remote);
+        while let Ok((cmd, resp_tx)) = cmd_rx.recv() {
+            let shutdown = matches!(cmd, EngineCommand::Shutdown);
+            let resp = proxy.execute(cmd);
+            if let Some(tx) = resp_tx {
+                let _ = tx.send(resp);
+            }
+            if shutdown {
+                break;
+            }
+        }
+    });
+
+    handle
+}
+
+fn cmd_monitor(mask_enabled: bool, api_bind: Option<String>, connect: Option<String>) {
+    if let Some(remote_api) = connect {
+        if api_bind.is_some() {
+            eprintln!("--connect cannot be used with --api");
+            std::process::exit(2);
+        }
+        let handle = spawn_http_proxy_handle(&remote_api);
+        if let Err(e) = tui::run_tui(handle.clone(), mask_enabled) {
+            eprintln!("TUI error: {}", e);
+        }
+        let _ = handle.send(EngineCommand::Shutdown);
+        return;
+    }
+
     let reg = match registry::load_registry() {
         Ok(r) => r,
         Err(e) => {
@@ -445,11 +719,7 @@ fn register_usb_device(
     let devices: Vec<_> = enumerator
         .scan_devices()
         .expect("failed to scan devices")
-        .filter(|d| {
-            d.property_value("DEVTYPE")
-                .and_then(|v| v.to_str())
-                == Some("usb_device")
-        })
+        .filter(|d| d.property_value("DEVTYPE").and_then(|v| v.to_str()) == Some("usb_device"))
         .filter_map(|d| registry::extract_identity(&d).map(|id| (id, d)))
         .collect();
 
@@ -753,10 +1023,8 @@ fn cmd_logs(name: Option<String>, lines: usize, follow: bool) {
                     if current_len > positions[i] {
                         let _ = file.seek(SeekFrom::Start(positions[i]));
                         let reader = BufReader::new(file);
-                        let device_name = log_path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("?");
+                        let device_name =
+                            log_path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
 
                         for line in reader.lines().filter_map(|l| l.ok()) {
                             println!("[{}] {}", device_name, line);

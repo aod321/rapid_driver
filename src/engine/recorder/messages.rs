@@ -19,8 +19,8 @@ pub struct SensorMessage {
 /// then serializes the whole map as JSON.
 pub fn msgpack_to_sensor_message(source_name: &str, raw: &[u8]) -> Result<SensorMessage, String> {
     let mut cursor = Cursor::new(raw);
-    let value = rmpv::decode::read_value(&mut cursor)
-        .map_err(|e| format!("msgpack decode: {}", e))?;
+    let value =
+        rmpv::decode::read_value(&mut cursor).map_err(|e| format!("msgpack decode: {}", e))?;
 
     let Value::Map(ref entries) = value else {
         return Err("expected msgpack Map at top level".into());
@@ -57,8 +57,8 @@ pub fn msgpack_to_sensor_message(source_name: &str, raw: &[u8]) -> Result<Sensor
 
     // Convert to JSON with binary → base64
     let json_value = rmpv_to_json(&value);
-    let json_data = serde_json::to_vec(&json_value)
-        .map_err(|e| format!("json serialize: {}", e))?;
+    let json_data =
+        serde_json::to_vec(&json_value).map_err(|e| format!("json serialize: {}", e))?;
 
     Ok(SensorMessage {
         source_name: source_name.to_string(),
@@ -83,25 +83,15 @@ fn rmpv_to_json(value: &Value) -> serde_json::Value {
                 serde_json::Value::Null
             }
         }
-        Value::F32(f) => {
-            serde_json::Number::from_f64(*f as f64)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null)
-        }
-        Value::F64(f) => {
-            serde_json::Number::from_f64(*f)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null)
-        }
-        Value::String(s) => {
-            serde_json::Value::String(s.as_str().unwrap_or("").to_string())
-        }
-        Value::Binary(b) => {
-            serde_json::Value::String(BASE64.encode(b))
-        }
-        Value::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(rmpv_to_json).collect())
-        }
+        Value::F32(f) => serde_json::Number::from_f64(*f as f64)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Value::F64(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Value::String(s) => serde_json::Value::String(s.as_str().unwrap_or("").to_string()),
+        Value::Binary(b) => serde_json::Value::String(BASE64.encode(b)),
+        Value::Array(arr) => serde_json::Value::Array(arr.iter().map(rmpv_to_json).collect()),
         Value::Map(entries) => {
             let mut map = serde_json::Map::new();
             for (k, v) in entries {
@@ -114,8 +104,6 @@ fn rmpv_to_json(value: &Value) -> serde_json::Value {
             }
             serde_json::Value::Object(map)
         }
-        Value::Ext(_, data) => {
-            serde_json::Value::String(BASE64.encode(data))
-        }
+        Value::Ext(_, data) => serde_json::Value::String(BASE64.encode(data)),
     }
 }

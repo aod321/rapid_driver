@@ -7,10 +7,10 @@ pub mod recording;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, SyncSender};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nix::libc;
 
@@ -19,9 +19,7 @@ use crate::mask::debug::{DebugState, DeviceDebugInfo};
 use crate::mask::{DebugPublisher, MaskLayout, MaskPublisher};
 use crate::registry::{self, DeviceEntry, Registry};
 
-use command::{
-    DeviceStatus, EngineCommand, EngineResponse, EngineStatus, RecordingInfo,
-};
+use command::{DeviceStatus, EngineCommand, EngineResponse, EngineStatus, RecordingInfo};
 use recorder::RecorderCore;
 use recording::{RecordingSession, RecordingState};
 
@@ -32,7 +30,7 @@ struct RunningProcess {
     on_detach: String,
     entry: DeviceEntry,
     restart_count: u32,
-    last_restart: Instant,
+    started_at: Instant,
 }
 
 /// Pending restart (non-blocking delay).
@@ -43,12 +41,24 @@ struct PendingRestart {
     restart_at: Instant,
 }
 
-/// Maximum restart attempts per window.
-const MAX_RESTART_COUNT: u32 = 5;
-/// Restart window in seconds.
-const RESTART_WINDOW_SECS: u64 = 60;
-/// Restart delay in milliseconds.
-const RESTART_DELAY_MS: u64 = 2000;
+#[derive(Debug, Clone, Default)]
+struct HeartbeatSnapshot {
+    updated_at: Option<f64>,
+    client_connected: Option<bool>,
+    last_frame_at: Option<f64>,
+    seq: Option<u64>,
+    pid: Option<u32>,
+    error: Option<String>,
+}
+
+const RESTART_BASE_DELAY_MS: u64 = 1_000;
+const RESTART_MAX_DELAY_MS: u64 = 30_000;
+const RESTART_JITTER_PCT: u64 = 10;
+
+const STATUS_REFRESH_MS: u64 = 200;
+const HEARTBEAT_STALE_SECS: f64 = 3.0;
+const CLIENT_DISCONNECT_GRACE_SECS: f64 = 4.0;
+const HEARTBEAT_STARTUP_GRACE_SECS: f64 = 6.0;
 
 type CommandMsg = (EngineCommand, Option<SyncSender<EngineResponse>>);
 
@@ -78,6 +88,9 @@ pub struct Engine {
 
     // Logging
     log_dir: PathBuf,
+    heartbeat_dir: PathBuf,
+    heartbeat_cache: HashMap<String, HeartbeatSnapshot>,
+    last_status_refresh: Instant,
 
     // Recording
     recording: Option<RecordingSession>,
@@ -104,6 +117,11 @@ impl Engine {
             .join("rapid_driver")
             .join("logs");
         let _ = fs::create_dir_all(&log_dir);
+        let heartbeat_dir = dirs::state_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("rapid_driver")
+            .join("heartbeat");
+        let _ = fs::create_dir_all(&heartbeat_dir);
 
         let device_names = registry.device_names_sorted();
         let layout = MaskLayout::load_or_default(&device_names);
@@ -128,10 +146,13 @@ impl Engine {
                 DeviceStatus {
                     name: name.clone(),
                     bit_index,
-                    online: false,
+                    discovered: false,
                     process_running: false,
                     pid: None,
                     backend,
+                    heartbeat_ok: None,
+                    last_heartbeat_age_ms: None,
+                    state_reason: None,
                     address: None,
                 }
             })
@@ -154,6 +175,9 @@ impl Engine {
             last_freq_check: Instant::now(),
             measured_freq: 0.0,
             log_dir,
+            heartbeat_dir,
+            heartbeat_cache: HashMap::new(),
+            last_status_refresh: Instant::now(),
             recording: None,
             recorder: RecorderCore::new(),
             pending_restarts: Vec::new(),
@@ -177,6 +201,7 @@ impl Engine {
             self.publish_debug();
             self.reap_exited();
             self.process_pending_restarts();
+            self.refresh_statuses_periodic();
             self.check_recording();
             self.tick_recorder();
 
@@ -326,7 +351,12 @@ impl Engine {
             self.terminate_process(&source_id);
         }
 
-        let entry = self.registry.devices.iter().find(|e| e.name == name).cloned();
+        let entry = self
+            .registry
+            .devices
+            .iter()
+            .find(|e| e.name == name)
+            .cloned();
         if let Some(entry) = entry {
             self.spawn_attach_with_count(&source_id, &entry, 0);
             self.update_device_statuses();
@@ -367,7 +397,12 @@ impl Engine {
             return EngineResponse::Error(format!("{}: already running", name));
         }
 
-        let entry = self.registry.devices.iter().find(|e| e.name == name).cloned();
+        let entry = self
+            .registry
+            .devices
+            .iter()
+            .find(|e| e.name == name)
+            .cloned();
         if let Some(entry) = entry {
             self.spawn_attach_with_count(&source_id, &entry, 0);
             self.update_device_statuses();
@@ -421,7 +456,11 @@ impl Engine {
         None
     }
 
-    fn resolve_recorder_sensor_address(&self, device_name: &str, entry: &DeviceEntry) -> Option<String> {
+    fn resolve_recorder_sensor_address(
+        &self,
+        device_name: &str,
+        entry: &DeviceEntry,
+    ) -> Option<String> {
         // iPhone app's _iphonevio._tcp address points to the phone's ephemeral listener.
         // The real recorder data source is the locally spawned node_iphone ZMQ PUB.
         if entry.backend == "mdns" && entry.service_type.contains("_iphonevio._tcp") {
@@ -460,22 +499,19 @@ impl Engine {
         let not_ready: Vec<&str> = self
             .devices
             .iter()
-            .filter(|d| !d.online || !d.process_running)
+            .filter(|d| !self.device_available(d))
             .map(|d| d.name.as_str())
             .collect();
 
         if !not_ready.is_empty() {
-            return EngineResponse::Error(format!(
-                "not connected: {}",
-                not_ready.join(", ")
-            ));
+            return EngineResponse::Error(format!("not connected: {}", not_ready.join(", ")));
         }
 
         // Determine which devices to record
         let target_devices: Vec<String> = devices.unwrap_or_else(|| {
             self.devices
                 .iter()
-                .filter(|d| d.online && d.process_running)
+                .filter(|d| self.device_available(d))
                 .map(|d| d.name.clone())
                 .collect()
         });
@@ -499,11 +535,7 @@ impl Engine {
         let sensors: Vec<recorder::SensorInfo> = target_devices
             .iter()
             .filter_map(|name| {
-                let entry = self
-                    .registry
-                    .devices
-                    .iter()
-                    .find(|e| e.name == *name)?;
+                let entry = self.registry.devices.iter().find(|e| e.name == *name)?;
                 let addr = self.resolve_recorder_sensor_address(name, entry)?;
                 Some(recorder::SensorInfo {
                     device_name: name.clone(),
@@ -520,7 +552,10 @@ impl Engine {
             );
         }
 
-        let mcap_error = match self.recorder.start_recording(&session_id, &output_dir, sensors) {
+        let mcap_error = match self
+            .recorder
+            .start_recording(&session_id, &output_dir, sensors)
+        {
             Ok(()) => None,
             Err(e) => {
                 eprintln!("[engine] MCAP recorder start error: {}", e);
@@ -578,7 +613,7 @@ impl Engine {
         let device_names: Vec<String> = self
             .devices
             .iter()
-            .filter(|d| d.online && d.process_running)
+            .filter(|d| d.process_running && d.heartbeat_ok.unwrap_or(true))
             .map(|d| d.name.clone())
             .collect();
 
@@ -610,7 +645,7 @@ impl Engine {
 
         let mut device_map = HashMap::new();
         for device in &self.devices {
-            device_map.insert(device.name.clone(), device.online && device.process_running);
+            device_map.insert(device.name.clone(), self.device_available(device));
         }
 
         let mask_snapshot = recorder::MaskSnapshot {
@@ -666,9 +701,16 @@ impl Engine {
                 DiscoveryEvent::Removed { source_id } => {
                     if let Some(name) = self.connected_devices.remove(&source_id) {
                         self.device_addresses.remove(&name);
-                    }
-                    if self.running.contains_key(&source_id) {
-                        self.terminate_process(&source_id);
+                        let backend = self
+                            .registry
+                            .devices
+                            .iter()
+                            .find(|e| e.name == name)
+                            .map(|e| e.backend.as_str())
+                            .unwrap_or("usb");
+                        if backend != "mdns" && self.running.contains_key(&source_id) {
+                            self.terminate_process(&source_id);
+                        }
                     }
                 }
             }
@@ -691,6 +733,23 @@ impl Engine {
             return;
         }
 
+        // For mDNS devices: if a process for the same device name is already running
+        // under a different source_id (e.g. iPhone re-advertised on a new port),
+        // migrate it to the new source_id instead of spawning a duplicate.
+        if entry.backend == "mdns" {
+            let existing = self
+                .running
+                .iter()
+                .find(|(_, proc)| proc.entry_name == entry.name)
+                .map(|(sid, _)| sid.clone());
+            if let Some(old_source_id) = existing {
+                if let Some(proc) = self.running.remove(&old_source_id) {
+                    self.running.insert(source_id.to_string(), proc);
+                }
+                return;
+            }
+        }
+
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(&entry.on_attach).process_group(0);
 
@@ -699,6 +758,12 @@ impl Engine {
             cmd.env("DEVICE_ADDR", addr);
         }
         cmd.env("DEVICE_NAME", &entry.name);
+        if self.device_uses_heartbeat(entry) {
+            let heartbeat_path = self.heartbeat_file_path(&entry.name);
+            let _ = fs::create_dir_all(&self.heartbeat_dir);
+            let _ = fs::remove_file(&heartbeat_path);
+            cmd.env("RAPID_HEARTBEAT_PATH", &heartbeat_path);
+        }
 
         let log_path = self.log_dir.join(format!("{}.log", entry.name));
         if let Ok(log_file) = File::create(&log_path) {
@@ -710,6 +775,7 @@ impl Engine {
         }
 
         if let Ok(child) = cmd.spawn() {
+            self.heartbeat_cache.remove(&entry.name);
             self.running.insert(
                 source_id.to_string(),
                 RunningProcess {
@@ -718,7 +784,7 @@ impl Engine {
                     on_detach: entry.on_detach.clone(),
                     entry: entry.clone(),
                     restart_count,
-                    last_restart: Instant::now(),
+                    started_at: Instant::now(),
                 },
             );
         }
@@ -760,12 +826,10 @@ impl Engine {
         }
 
         std::thread::sleep(Duration::from_millis(500));
+        self.heartbeat_cache.remove(&proc.entry_name);
 
         if !proc.on_detach.is_empty() {
-            let _ = Command::new("sh")
-                .arg("-c")
-                .arg(&proc.on_detach)
-                .status();
+            let _ = Command::new("sh").arg("-c").arg(&proc.on_detach).status();
         }
     }
 
@@ -788,24 +852,16 @@ impl Engine {
         for (source_id, proc) in self.running.iter_mut() {
             if let Ok(Some(_status)) = proc.child.try_wait() {
                 let still_exists = self.connected_devices.contains_key(source_id);
-                if still_exists {
-                    let current_count = if proc.last_restart.elapsed()
-                        > Duration::from_secs(RESTART_WINDOW_SECS)
-                    {
-                        0
-                    } else {
-                        proc.restart_count
-                    };
-
-                    if current_count < MAX_RESTART_COUNT {
-                        self.pending_restarts.push(PendingRestart {
-                            source_id: source_id.clone(),
-                            entry: proc.entry.clone(),
-                            restart_count: current_count + 1,
-                            restart_at: Instant::now()
-                                + Duration::from_millis(RESTART_DELAY_MS),
-                        });
-                    }
+                let should_restart = still_exists || proc.entry.backend == "mdns";
+                if should_restart {
+                    let next_count = proc.restart_count.saturating_add(1);
+                    let delay_ms = Self::restart_delay_ms(next_count);
+                    self.pending_restarts.push(PendingRestart {
+                        source_id: source_id.clone(),
+                        entry: proc.entry.clone(),
+                        restart_count: next_count,
+                        restart_at: Instant::now() + Duration::from_millis(delay_ms),
+                    });
                 }
                 exited.push(source_id.clone());
             }
@@ -834,7 +890,9 @@ impl Engine {
         self.pending_restarts = still_pending;
 
         for restart in ready {
-            if self.connected_devices.contains_key(&restart.source_id) {
+            if self.connected_devices.contains_key(&restart.source_id)
+                || restart.entry.backend == "mdns"
+            {
                 self.spawn_attach_with_count(
                     &restart.source_id,
                     &restart.entry,
@@ -847,26 +905,257 @@ impl Engine {
 
     // ── Status & mask ───────────────────────────────────────────────
 
+    fn refresh_statuses_periodic(&mut self) {
+        if self.last_status_refresh.elapsed() >= Duration::from_millis(STATUS_REFRESH_MS) {
+            self.update_device_statuses();
+        }
+    }
+
     fn update_device_statuses(&mut self) {
-        let connected_names: HashSet<&String> = self.connected_devices.values().collect();
-        let running_pids: HashMap<&String, u32> = self
+        let connected_names: HashSet<String> = self.connected_devices.values().cloned().collect();
+        let running_pids: HashMap<String, u32> = self
             .running
             .values()
-            .map(|p| (&p.entry_name, p.child.id()))
+            .map(|p| (p.entry_name.clone(), p.child.id()))
             .collect();
+        let running_uptime_secs: HashMap<String, f64> = self
+            .running
+            .values()
+            .map(|p| (p.entry_name.clone(), p.started_at.elapsed().as_secs_f64()))
+            .collect();
+        let running_sources_by_name: HashMap<String, String> = self
+            .running
+            .iter()
+            .map(|(source_id, p)| (p.entry_name.clone(), source_id.clone()))
+            .collect();
+        let heartbeat_devices: Vec<String> = self
+            .registry
+            .devices
+            .iter()
+            .filter(|e| self.device_uses_heartbeat(e))
+            .map(|e| e.name.clone())
+            .collect();
+        self.refresh_heartbeat_cache(&heartbeat_devices);
+        let heartbeat_cache = self.heartbeat_cache.clone();
+        let device_addresses = self.device_addresses.clone();
+
+        let heartbeat_device_set: HashSet<String> = heartbeat_devices.into_iter().collect();
+        let now_unix_secs = Self::now_unix_secs();
+        let mut restart_sources: HashSet<String> = HashSet::new();
 
         for device in &mut self.devices {
-            device.online = connected_names.contains(&device.name);
-            device.process_running = running_pids.contains_key(&device.name);
-            device.pid = running_pids.get(&device.name).copied();
-            device.address = self.device_addresses.get(&device.name).cloned();
+            let uses_heartbeat = heartbeat_device_set.contains(&device.name);
+            let heartbeat = heartbeat_cache.get(&device.name);
+            let _heartbeat_seq = heartbeat.and_then(|hb| hb.seq);
+            let heartbeat_age_ms =
+                heartbeat.and_then(|hb| Self::heartbeat_age_ms(hb, now_unix_secs));
+            let heartbeat_fresh = heartbeat_age_ms
+                .map(|age| (age as f64 / 1000.0) <= HEARTBEAT_STALE_SECS)
+                .unwrap_or(false);
+
+            let online = connected_names.contains(&device.name);
+            let process_running = running_pids.contains_key(&device.name);
+            let pid = running_pids.get(&device.name).copied();
+            let process_uptime_secs = running_uptime_secs
+                .get(&device.name)
+                .copied()
+                .unwrap_or(0.0);
+            let startup_grace = uses_heartbeat
+                && process_running
+                && process_uptime_secs <= HEARTBEAT_STARTUP_GRACE_SECS;
+            let last_frame_age_secs = heartbeat
+                .and_then(|hb| hb.last_frame_at)
+                .map(|last| (now_unix_secs - last).max(0.0));
+            let disconnected_too_long = uses_heartbeat
+                && heartbeat_fresh
+                && heartbeat
+                    .and_then(|hb| hb.client_connected)
+                    .is_some_and(|connected| !connected)
+                // Only enforce disconnection timeout once we've seen real frame activity.
+                && last_frame_age_secs.is_some_and(|age| age > CLIENT_DISCONNECT_GRACE_SECS);
+
+            let heartbeat_ok = if uses_heartbeat {
+                heartbeat_fresh && !disconnected_too_long
+            } else {
+                true
+            };
+            let has_heartbeat_error = heartbeat
+                .and_then(|hb| hb.error.as_deref())
+                .is_some_and(|err| !err.is_empty());
+            let ready = process_running && heartbeat_ok;
+            let reason = if ready {
+                None
+            } else if !process_running {
+                if device.backend == "mdns" && !online {
+                    Some("mdns_missing".to_string())
+                } else {
+                    Some("process_down".to_string())
+                }
+            } else if uses_heartbeat {
+                if startup_grace && !heartbeat_fresh {
+                    Some("starting".to_string())
+                } else if disconnected_too_long {
+                    Some("client_disconnected".to_string())
+                } else {
+                    Some("heartbeat_stale".to_string())
+                }
+            } else if device.backend == "mdns" && !online {
+                Some("mdns_missing".to_string())
+            } else {
+                Some("process_down".to_string())
+            };
+
+            if process_running
+                && uses_heartbeat
+                && !startup_grace
+                && (!heartbeat_fresh || disconnected_too_long)
+            {
+                if let Some(source_id) = running_sources_by_name.get(&device.name) {
+                    restart_sources.insert(source_id.clone());
+                }
+            }
+
+            if process_running && uses_heartbeat && !startup_grace && has_heartbeat_error {
+                if let Some(source_id) = running_sources_by_name.get(&device.name) {
+                    restart_sources.insert(source_id.clone());
+                }
+            }
+
+            device.discovered = online;
+            device.process_running = process_running;
+            device.pid = pid;
+            device.heartbeat_ok = if uses_heartbeat {
+                Some(heartbeat_ok)
+            } else {
+                None
+            };
+            device.last_heartbeat_age_ms = if uses_heartbeat {
+                heartbeat_age_ms
+            } else {
+                None
+            };
+            device.state_reason = reason;
+            device.address = device_addresses.get(&device.name).cloned();
         }
+
+        for source_id in restart_sources {
+            let Some(proc) = self.running.get(&source_id) else {
+                continue;
+            };
+            let next_count = proc.restart_count.saturating_add(1);
+            let delay_ms = Self::restart_delay_ms(next_count);
+            let entry = proc.entry.clone();
+            self.pending_restarts.retain(|r| r.source_id != source_id);
+            self.pending_restarts.push(PendingRestart {
+                source_id: source_id.clone(),
+                entry,
+                restart_count: next_count,
+                restart_at: Instant::now() + Duration::from_millis(delay_ms),
+            });
+            self.terminate_process(&source_id);
+        }
+
+        self.last_status_refresh = Instant::now();
+    }
+
+    fn device_uses_heartbeat(&self, entry: &DeviceEntry) -> bool {
+        entry.backend == "mdns" && entry.service_type.contains("_iphonevio._tcp")
+    }
+
+    fn heartbeat_file_path(&self, device_name: &str) -> PathBuf {
+        let safe_name: String = device_name
+            .chars()
+            .map(|c| match c {
+                'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' => c,
+                _ => '_',
+            })
+            .collect();
+        self.heartbeat_dir.join(format!("{safe_name}.json"))
+    }
+
+    fn refresh_heartbeat_cache(&mut self, heartbeat_devices: &[String]) {
+        for device_name in heartbeat_devices {
+            let path = self.heartbeat_file_path(device_name);
+            match Self::read_heartbeat_file(&path) {
+                Some(snapshot) => {
+                    self.heartbeat_cache.insert(device_name.clone(), snapshot);
+                }
+                None => {
+                    self.heartbeat_cache.remove(device_name);
+                }
+            }
+        }
+    }
+
+    fn read_heartbeat_file(path: &Path) -> Option<HeartbeatSnapshot> {
+        let raw = fs::read_to_string(path).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+        let mut updated_at = value.get("updated_at").and_then(|v| v.as_f64());
+        if updated_at.is_none() {
+            updated_at = fs::metadata(path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs_f64());
+        }
+        Some(HeartbeatSnapshot {
+            updated_at,
+            client_connected: value.get("client_connected").and_then(|v| v.as_bool()),
+            last_frame_at: value.get("last_frame_at").and_then(|v| v.as_f64()),
+            seq: value.get("seq").and_then(|v| v.as_u64()),
+            pid: value
+                .get("pid")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok()),
+            error: value
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        })
+    }
+
+    fn now_unix_secs() -> f64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64()
+    }
+
+    fn heartbeat_age_ms(snapshot: &HeartbeatSnapshot, now_unix_secs: f64) -> Option<u64> {
+        let updated = snapshot.updated_at?;
+        if now_unix_secs <= updated {
+            return Some(0);
+        }
+        Some(((now_unix_secs - updated) * 1000.0) as u64)
+    }
+
+    fn restart_delay_ms(restart_count: u32) -> u64 {
+        let exp = restart_count.saturating_sub(1).min(10);
+        let mut delay_ms = RESTART_BASE_DELAY_MS.saturating_mul(1u64 << exp);
+        delay_ms = delay_ms.min(RESTART_MAX_DELAY_MS);
+
+        let jitter_span = delay_ms.saturating_mul(RESTART_JITTER_PCT) / 100;
+        if jitter_span == 0 {
+            return delay_ms;
+        }
+        let now_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as u64;
+        let range = jitter_span.saturating_mul(2).saturating_add(1);
+        let offset = (now_ns % range) as i64 - jitter_span as i64;
+        let jittered = (delay_ms as i64 + offset).clamp(100, RESTART_MAX_DELAY_MS as i64);
+        jittered as u64
+    }
+
+    fn device_available(&self, device: &DeviceStatus) -> bool {
+        device.process_running && device.heartbeat_ok.unwrap_or(true)
     }
 
     fn compute_mask(&self) -> u64 {
         let mut mask: u64 = 0;
         for device in &self.devices {
-            if device.online && device.process_running && device.bit_index < 64 {
+            if self.device_available(device) && device.bit_index < 64 {
                 mask |= 1u64 << device.bit_index;
             }
         }
@@ -909,8 +1198,8 @@ impl Engine {
                 device.name.clone(),
                 DeviceDebugInfo {
                     bit: device.bit_index,
-                    online: device.online && device.process_running,
-                    usb_connected: device.online,
+                    online: device.process_running && device.heartbeat_ok.unwrap_or(true),
+                    usb_connected: device.discovered,
                     process_running: device.process_running,
                     pid: device.pid,
                 },
@@ -944,13 +1233,17 @@ impl Engine {
                 DeviceStatus {
                     name: name.clone(),
                     bit_index,
-                    online: connected_names.contains(name),
+                    discovered: connected_names.contains(name),
                     process_running: running_pids.contains_key(name),
                     pid: running_pids.get(name).copied(),
                     backend,
+                    heartbeat_ok: None,
+                    last_heartbeat_age_ms: None,
+                    state_reason: None,
                     address: self.device_addresses.get(name).cloned(),
                 }
             })
             .collect();
+        self.update_device_statuses();
     }
 }

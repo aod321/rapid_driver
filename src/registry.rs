@@ -56,16 +56,19 @@ pub fn load_registry() -> Result<Registry, String> {
     if !path.exists() {
         return Ok(Registry::default());
     }
-    let content = fs::read_to_string(&path).map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
+    let content = fs::read_to_string(&path)
+        .map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
     toml::from_str(&content).map_err(|e| format!("failed to parse {}: {}", path.display(), e))
 }
 
 pub fn save_registry(registry: &Registry) -> Result<(), String> {
     let path = registry_path();
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("failed to create directory {}: {}", parent.display(), e))?;
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create directory {}: {}", parent.display(), e))?;
     }
-    let content = toml::to_string_pretty(registry).map_err(|e| format!("failed to serialize registry: {}", e))?;
+    let content = toml::to_string_pretty(registry)
+        .map_err(|e| format!("failed to serialize registry: {}", e))?;
     fs::write(&path, content).map_err(|e| format!("failed to write {}: {}", path.display(), e))
 }
 
@@ -79,7 +82,12 @@ pub fn extract_identity(device: &udev::Device) -> Option<UsbIdentity> {
         .unwrap_or("")
         .to_string();
     let sysname = device.sysname().to_string_lossy().into_owned();
-    Some(UsbIdentity { vid, pid, serial, sysname })
+    Some(UsbIdentity {
+        vid,
+        pid,
+        serial,
+        sysname,
+    })
 }
 
 #[cfg(target_os = "linux")]

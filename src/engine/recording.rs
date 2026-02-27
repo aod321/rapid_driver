@@ -68,12 +68,7 @@ impl RecordingSession {
     }
 
     /// Spawn on_record_start for a device.
-    pub fn start_device(
-        &mut self,
-        device_name: &str,
-        entry: &DeviceEntry,
-        address: Option<&str>,
-    ) {
+    pub fn start_device(&mut self, device_name: &str, entry: &DeviceEntry, address: Option<&str>) {
         if entry.on_record_start.is_empty() {
             self.device_states
                 .insert(device_name.to_string(), DeviceRecordState::Done);
@@ -93,12 +88,7 @@ impl RecordingSession {
     }
 
     /// Spawn on_record_stop for a device.
-    pub fn stop_device(
-        &mut self,
-        device_name: &str,
-        entry: &DeviceEntry,
-        address: Option<&str>,
-    ) {
+    pub fn stop_device(&mut self, device_name: &str, entry: &DeviceEntry, address: Option<&str>) {
         if entry.on_record_stop.is_empty() {
             self.device_states
                 .insert(device_name.to_string(), DeviceRecordState::Done);
@@ -182,8 +172,7 @@ impl RecordingSession {
             match self.state {
                 RecordingState::Starting => {
                     if any_failed {
-                        self.state =
-                            RecordingState::Failed("some devices failed to start".into());
+                        self.state = RecordingState::Failed("some devices failed to start".into());
                     } else {
                         self.state = RecordingState::Recording;
                     }

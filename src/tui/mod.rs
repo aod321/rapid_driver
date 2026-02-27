@@ -4,26 +4,31 @@
 
 mod events;
 
-use crate::engine::command::{DeviceStatus, EngineCommand, EngineHandle, EngineResponse, RecordingInfo};
+use crate::engine::command::{
+    DeviceStatus, EngineCommand, EngineHandle, EngineResponse, RecordingInfo,
+};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use events::AppEvent;
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
-    Frame, Terminal,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+const LOG_DEDUPE_SCAN_MULTIPLIER: usize = 8;
+const LOG_RECENT_WINDOW_SECS: u64 = 12;
 
 /// Application mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +60,7 @@ pub struct App {
     // Log display
     log_dir: PathBuf,
     pub log_cache: HashMap<String, VecDeque<String>>,
+    pub log_last_change: HashMap<String, Instant>,
     max_log_lines: usize,
 }
 
@@ -66,7 +72,7 @@ impl App {
             .join("logs");
 
         // Get initial status from engine
-        let (devices, current_mask, sequence, measured_freq, recording) =
+        let (devices, current_mask, sequence, measured_freq, recording, resolved_mask_enabled) =
             if let Ok(EngineResponse::Status(status)) = handle.request(EngineCommand::GetStatus) {
                 (
                     status.devices,
@@ -74,9 +80,10 @@ impl App {
                     status.sequence,
                     status.measured_freq,
                     status.recording,
+                    status.mask_enabled,
                 )
             } else {
-                (vec![], 0, 0, 0.0, None)
+                (vec![], 0, 0, 0.0, None, mask_enabled)
             };
 
         App {
@@ -88,13 +95,35 @@ impl App {
             current_mask,
             sequence,
             measured_freq,
-            mask_enabled,
+            mask_enabled: resolved_mask_enabled,
             recording,
             handle,
             log_dir,
             log_cache: HashMap::new(),
-            max_log_lines: 10,
+            log_last_change: HashMap::new(),
+            max_log_lines: 20,
         }
+    }
+
+    fn dedupe_recent_lines(lines: &[String], limit: usize) -> Vec<String> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out_rev: Vec<String> = Vec::new();
+
+        for line in lines.iter().rev() {
+            let normalized = line.trim().to_string();
+            if normalized.is_empty() {
+                continue;
+            }
+            if seen.insert(normalized) {
+                out_rev.push(line.clone());
+                if out_rev.len() >= limit {
+                    break;
+                }
+            }
+        }
+
+        out_rev.reverse();
+        out_rev
     }
 
     /// Refresh cached state from engine.
@@ -104,6 +133,7 @@ impl App {
             self.current_mask = status.current_mask;
             self.sequence = status.sequence;
             self.measured_freq = status.measured_freq;
+            self.mask_enabled = status.mask_enabled;
             self.recording = status.recording;
         }
     }
@@ -127,7 +157,10 @@ impl App {
             return;
         };
         let name = device.name.clone();
-        match self.handle.request(EngineCommand::RestartDevice { name: name.clone() }) {
+        match self
+            .handle
+            .request(EngineCommand::RestartDevice { name: name.clone() })
+        {
             Ok(EngineResponse::Ok) => self.set_status(format!("{}: restarted", name)),
             Ok(EngineResponse::Error(e)) => self.set_status(format!("{}: {}", name, e)),
             _ => self.set_status(format!("{}: engine error", name)),
@@ -165,7 +198,9 @@ impl App {
     }
 
     fn export_layout(&mut self, path: &str) {
-        match self.handle.request(EngineCommand::ExportLayout { path: path.to_string() }) {
+        match self.handle.request(EngineCommand::ExportLayout {
+            path: path.to_string(),
+        }) {
             Ok(EngineResponse::Ok) => self.set_status(format!("Exported to {}", path)),
             Ok(EngineResponse::Error(e)) => self.set_status(format!("Export error: {}", e)),
             _ => self.set_status("Engine error".into()),
@@ -173,7 +208,9 @@ impl App {
     }
 
     fn import_layout(&mut self, path: &str) {
-        match self.handle.request(EngineCommand::ImportLayout { path: path.to_string() }) {
+        match self.handle.request(EngineCommand::ImportLayout {
+            path: path.to_string(),
+        }) {
             Ok(EngineResponse::Ok) => {
                 self.refresh_status();
                 self.set_status(format!("Imported from {}", path));
@@ -190,7 +227,10 @@ impl App {
             .is_some_and(|r| r.state == "recording" || r.state == "starting");
 
         if is_active {
-            match self.handle.request(EngineCommand::StopRecording { session_id: None }) {
+            match self
+                .handle
+                .request(EngineCommand::StopRecording { session_id: None })
+            {
                 Ok(EngineResponse::Ok) => self.set_status("Recording stopping...".into()),
                 Ok(EngineResponse::Error(e)) => self.set_status(format!("Stop error: {}", e)),
                 _ => self.set_status("Engine error".into()),
@@ -205,7 +245,7 @@ impl App {
             let not_ready: Vec<&str> = self
                 .devices
                 .iter()
-                .filter(|d| !d.online || !d.process_running)
+                .filter(|d| !(d.process_running && d.heartbeat_ok.unwrap_or(true)))
                 .map(|d| d.name.as_str())
                 .collect();
 
@@ -234,16 +274,29 @@ impl App {
         if let Ok(file) = File::open(&log_path) {
             let reader = BufReader::new(file);
             let lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
-            let start = lines.len().saturating_sub(self.max_log_lines);
+            let scan_window = self
+                .max_log_lines
+                .saturating_mul(LOG_DEDUPE_SCAN_MULTIPLIER);
+            let start = lines.len().saturating_sub(scan_window);
+            let deduped = Self::dedupe_recent_lines(&lines[start..], self.max_log_lines);
 
             let cache = self
                 .log_cache
                 .entry(device_name.to_string())
                 .or_insert_with(VecDeque::new);
-            cache.clear();
-            for line in &lines[start..] {
-                cache.push_back(line.clone());
+
+            let changed = cache.len() != deduped.len() || !cache.iter().eq(deduped.iter());
+            if changed {
+                cache.clear();
+                for line in deduped {
+                    cache.push_back(line);
+                }
+                self.log_last_change
+                    .insert(device_name.to_string(), Instant::now());
             }
+        } else {
+            self.log_cache.remove(device_name);
+            self.log_last_change.remove(device_name);
         }
     }
 }
@@ -441,8 +494,8 @@ fn ui(f: &mut Frame, app: &App) {
         }
     }
 
-    let header = Paragraph::new(Line::from(header_spans))
-        .block(Block::default().borders(Borders::ALL));
+    let header =
+        Paragraph::new(Line::from(header_spans)).block(Block::default().borders(Borders::ALL));
     f.render_widget(header, chunks[0]);
 
     // Main content
@@ -495,9 +548,10 @@ fn render_device_list(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .enumerate()
         .map(|(i, device)| {
-            let status_icon = if device.online && device.process_running {
+            let ready = device.process_running && device.heartbeat_ok.unwrap_or(true);
+            let status_icon = if ready {
                 Span::styled("●", Style::default().fg(Color::Green))
-            } else if device.online {
+            } else if device.process_running || device.discovered {
                 Span::styled("◐", Style::default().fg(Color::Yellow))
             } else {
                 Span::styled("○", Style::default().fg(Color::Red))
@@ -604,19 +658,26 @@ fn render_mask_display(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_log_preview(f: &mut Frame, app: &App, area: Rect) {
     let selected_device = app.devices.get(app.selected);
-    let device_name = selected_device
-        .map(|d| d.name.as_str())
-        .unwrap_or("(none)");
+    let device_name = selected_device.map(|d| d.name.as_str()).unwrap_or("(none)");
 
     let logs = app
         .log_cache
         .get(device_name)
         .map(|q| q.iter().cloned().collect::<Vec<_>>())
         .unwrap_or_default();
+    let is_recent = app
+        .log_last_change
+        .get(device_name)
+        .is_some_and(|t| t.elapsed() <= Duration::from_secs(LOG_RECENT_WINDOW_SECS));
 
     let lines: Vec<Line> = if logs.is_empty() {
         vec![Line::from(Span::styled(
             "(no output)",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else if !is_recent {
+        vec![Line::from(Span::styled(
+            "(no recent output)",
             Style::default().fg(Color::DarkGray),
         ))]
     } else {
@@ -636,9 +697,7 @@ fn render_log_preview(f: &mut Frame, app: &App, area: Rect) {
         .title(format!(" Log: {} ", device_name))
         .borders(Borders::ALL);
 
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: true });
+    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
     f.render_widget(paragraph, area);
 }
 
@@ -657,7 +716,10 @@ fn render_recorder_panel(f: &mut Frame, app: &App, area: Rect) {
 
             lines.push(Line::from(vec![
                 Span::styled(format!(" {} ", icon), Style::default().fg(color)),
-                Span::styled(&rec.state, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    &rec.state,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
             ]));
 
             // Session ID
@@ -714,9 +776,7 @@ fn render_recorder_panel(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    let block = Block::default()
-        .title(" Recorder ")
-        .borders(Borders::ALL);
+    let block = Block::default().title(" Recorder ").borders(Borders::ALL);
 
     let paragraph = Paragraph::new(lines).block(block);
     f.render_widget(paragraph, area);

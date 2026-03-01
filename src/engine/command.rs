@@ -7,6 +7,52 @@ use serde::{Deserialize, Serialize};
 
 use crate::registry::{DeviceEntry, Registry};
 
+/// A single recording file entry returned by list recordings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordingFileEntry {
+    pub session_id: String,
+    pub filename: String,
+    pub size_bytes: u64,
+    pub created_at: String,
+    pub duration_secs: Option<f64>,
+    pub message_count: Option<u64>,
+    /// True if this file is currently being recorded or replayed (cannot be deleted).
+    pub is_locked: bool,
+}
+
+/// A failed batch-delete entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchDeleteFailure {
+    pub session_id: String,
+    pub error: String,
+}
+
+/// Replay state enum with richer states than just active/inactive.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayState {
+    Idle,
+    Starting,
+    Running,
+    Stopping,
+    Completed,
+    Error,
+}
+
+/// Replay status snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayStatusInfo {
+    pub active: bool,
+    pub state: ReplayState,
+    pub session_id: Option<String>,
+    pub progress: f64,
+    pub elapsed_secs: f64,
+    pub total_secs: f64,
+    pub speed: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Status of a single device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceStatus {
@@ -97,6 +143,24 @@ pub enum EngineCommand {
     ImportLayout {
         path: String,
     },
+    /// Recordings management
+    ListRecordings {
+        sort: Option<String>,
+        order: Option<String>,
+    },
+    DeleteRecording {
+        session_id: String,
+    },
+    DeleteRecordingsBatch {
+        session_ids: Vec<String>,
+    },
+    /// Replay
+    StartReplay {
+        session_id: String,
+        speed: Option<f64>,
+    },
+    StopReplay,
+    GetReplayStatus,
     /// Graceful shutdown.
     Shutdown,
 }
@@ -113,7 +177,33 @@ pub enum EngineResponse {
         layout: Vec<String>,
     },
     RecordingStatus(Option<RecordingInfo>),
+    /// Recordings list
+    RecordingsList {
+        recordings: Vec<RecordingFileEntry>,
+        total_size_bytes: u64,
+        disk_free_bytes: u64,
+    },
+    /// Single delete result
+    Deleted(String),
+    /// Batch delete result
+    BatchDeleteResult {
+        deleted: Vec<String>,
+        failed: Vec<BatchDeleteFailure>,
+    },
+    /// Replay started
+    ReplayStarted {
+        session_id: String,
+        total_secs: f64,
+        message_count: u64,
+    },
+    /// Replay status
+    ReplayStatus(ReplayStatusInfo),
     Ok,
+    /// Error with HTTP status code hint
+    ErrorWithStatus {
+        status: u16,
+        message: String,
+    },
     Error(String),
 }
 

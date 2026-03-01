@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
@@ -33,6 +33,14 @@ pub fn router() -> Router<EngineHandle> {
         .route("/layout/export", post(export_layout))
         .route("/layout/import", post(import_layout))
         .route("/shutdown", post(shutdown))
+        // Recordings management
+        .route("/recordings", get(list_recordings))
+        .route("/recordings/{session_id}", delete(delete_recording))
+        .route("/recordings/delete_batch", post(delete_recordings_batch))
+        // Replay
+        .route("/recordings/{session_id}/replay", post(start_replay))
+        .route("/replay/stop", post(stop_replay))
+        .route("/replay/status", get(get_replay_status))
 }
 
 /// Helper: run a blocking engine request on the tokio blocking pool.
@@ -388,4 +396,166 @@ async fn get_recording_status(State(handle): State<EngineHandle>) -> impl IntoRe
 async fn shutdown(State(handle): State<EngineHandle>) -> impl IntoResponse {
     let _ = engine_request(handle, EngineCommand::Shutdown).await;
     Json(serde_json::json!({"ok": true, "message": "shutting down"}))
+}
+
+// ── Recordings management ──────────────────────────────────────────
+
+/// Helper: map ErrorWithStatus to proper HTTP response.
+fn error_with_status(status: u16, message: String) -> axum::response::Response {
+    let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (code, Json(serde_json::json!({"error": message}))).into_response()
+}
+
+#[derive(Deserialize)]
+struct ListRecordingsQuery {
+    #[serde(default)]
+    sort: Option<String>,
+    #[serde(default)]
+    order: Option<String>,
+}
+
+async fn list_recordings(
+    State(handle): State<EngineHandle>,
+    Query(query): Query<ListRecordingsQuery>,
+) -> impl IntoResponse {
+    match engine_request(
+        handle,
+        EngineCommand::ListRecordings {
+            sort: query.sort,
+            order: query.order,
+        },
+    )
+    .await
+    {
+        Ok(EngineResponse::RecordingsList {
+            recordings,
+            total_size_bytes,
+            disk_free_bytes,
+        }) => Json(serde_json::json!({
+            "recordings": recordings,
+            "total_size_bytes": total_size_bytes,
+            "disk_free_bytes": disk_free_bytes,
+        }))
+        .into_response(),
+        Ok(EngineResponse::ErrorWithStatus { status, message }) => {
+            error_with_status(status, message)
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn delete_recording(
+    State(handle): State<EngineHandle>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    match engine_request(
+        handle,
+        EngineCommand::DeleteRecording { session_id },
+    )
+    .await
+    {
+        Ok(EngineResponse::Deleted(sid)) => {
+            Json(serde_json::json!({"deleted": sid})).into_response()
+        }
+        Ok(EngineResponse::ErrorWithStatus { status, message }) => {
+            error_with_status(status, message)
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct BatchDeleteRequest {
+    #[serde(default)]
+    session_ids: Option<Vec<String>>,
+}
+
+async fn delete_recordings_batch(
+    State(handle): State<EngineHandle>,
+    Json(req): Json<BatchDeleteRequest>,
+) -> impl IntoResponse {
+    let session_ids = match req.session_ids {
+        Some(ids) if !ids.is_empty() => ids,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "session_ids is required and must not be empty"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    match engine_request(
+        handle,
+        EngineCommand::DeleteRecordingsBatch { session_ids },
+    )
+    .await
+    {
+        Ok(EngineResponse::BatchDeleteResult { deleted, failed }) => {
+            Json(serde_json::json!({
+                "deleted": deleted,
+                "failed": failed,
+            }))
+            .into_response()
+        }
+        Ok(EngineResponse::ErrorWithStatus { status, message }) => {
+            error_with_status(status, message)
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+// ── Replay ─────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct StartReplayRequest {
+    #[serde(default)]
+    speed: Option<f64>,
+}
+
+async fn start_replay(
+    State(handle): State<EngineHandle>,
+    Path(session_id): Path<String>,
+    Json(req): Json<StartReplayRequest>,
+) -> impl IntoResponse {
+    match engine_request(
+        handle,
+        EngineCommand::StartReplay {
+            session_id,
+            speed: req.speed,
+        },
+    )
+    .await
+    {
+        Ok(EngineResponse::ReplayStarted {
+            session_id,
+            total_secs,
+            message_count,
+        }) => Json(serde_json::json!({
+            "session_id": session_id,
+            "total_secs": total_secs,
+            "message_count": message_count,
+        }))
+        .into_response(),
+        Ok(EngineResponse::ErrorWithStatus { status, message }) => {
+            error_with_status(status, message)
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn stop_replay(State(handle): State<EngineHandle>) -> impl IntoResponse {
+    match engine_request(handle, EngineCommand::StopReplay).await {
+        Ok(EngineResponse::Ok) => Json(serde_json::json!({"stopped": true})).into_response(),
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn get_replay_status(State(handle): State<EngineHandle>) -> impl IntoResponse {
+    match engine_request(handle, EngineCommand::GetReplayStatus).await {
+        Ok(EngineResponse::ReplayStatus(info)) => Json(serde_json::json!(info)).into_response(),
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }

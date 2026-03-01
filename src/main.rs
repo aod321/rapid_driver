@@ -322,6 +322,15 @@ impl HttpEngineProxy {
                 let payload = serde_json::json!({ "path": path });
                 self.run_ok_post_json("/layout/import", &payload)
             }
+            // Recordings management — passthrough (TUI doesn't use these)
+            EngineCommand::ListRecordings { .. }
+            | EngineCommand::DeleteRecording { .. }
+            | EngineCommand::DeleteRecordingsBatch { .. }
+            | EngineCommand::StartReplay { .. }
+            | EngineCommand::StopReplay
+            | EngineCommand::GetReplayStatus => {
+                EngineResponse::Error("not supported via proxy".into())
+            }
             EngineCommand::Shutdown => EngineResponse::Ok,
         }
     }

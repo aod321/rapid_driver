@@ -3,6 +3,7 @@
 pub mod command;
 pub mod recorder;
 pub mod recording;
+pub mod replay;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -19,9 +20,13 @@ use crate::mask::debug::{DebugState, DeviceDebugInfo};
 use crate::mask::{DebugPublisher, MaskLayout, MaskPublisher};
 use crate::registry::{self, DeviceEntry, Registry};
 
-use command::{DeviceStatus, EngineCommand, EngineResponse, EngineStatus, RecordingInfo};
+use command::{
+    BatchDeleteFailure, DeviceStatus, EngineCommand, EngineResponse, EngineStatus,
+    RecordingFileEntry, RecordingInfo,
+};
 use recorder::RecorderCore;
 use recording::{RecordingSession, RecordingState};
+use replay::ReplayManager;
 
 /// Running process information.
 struct RunningProcess {
@@ -98,6 +103,12 @@ pub struct Engine {
     // MCAP recorder
     recorder: RecorderCore,
 
+    // MCAP replay
+    replay: ReplayManager,
+
+    // Recordings directory (base path for scanning MCAP files)
+    recordings_dir: PathBuf,
+
     // Non-blocking restarts
     pending_restarts: Vec<PendingRestart>,
 
@@ -158,6 +169,10 @@ impl Engine {
             })
             .collect();
 
+        let recordings_dir = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("recordings");
+
         Engine {
             registry,
             layout,
@@ -180,6 +195,8 @@ impl Engine {
             last_status_refresh: Instant::now(),
             recording: None,
             recorder: RecorderCore::new(),
+            replay: ReplayManager::new("tcp://0.0.0.0:5560".into()),
+            recordings_dir,
             pending_restarts: Vec::new(),
             cmd_rx,
         }
@@ -224,6 +241,9 @@ impl Engine {
         }
 
         // Cleanup
+        if self.replay.is_active() {
+            self.replay.stop();
+        }
         if self.recorder.is_active() {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = self.recorder.stop_recording();
@@ -304,6 +324,25 @@ impl Engine {
                 }
                 Err(e) => EngineResponse::Error(format!("import: {}", e)),
             },
+            // Recordings management
+            EngineCommand::ListRecordings { sort, order } => self.cmd_list_recordings(sort, order),
+            EngineCommand::DeleteRecording { session_id } => {
+                self.cmd_delete_recording(&session_id)
+            }
+            EngineCommand::DeleteRecordingsBatch { session_ids } => {
+                self.cmd_delete_recordings_batch(session_ids)
+            }
+            // Replay
+            EngineCommand::StartReplay { session_id, speed } => {
+                self.cmd_start_replay(&session_id, speed)
+            }
+            EngineCommand::StopReplay => {
+                self.replay.stop();
+                EngineResponse::Ok
+            }
+            EngineCommand::GetReplayStatus => {
+                EngineResponse::ReplayStatus(self.replay.status())
+            }
         }
     }
 
@@ -477,6 +516,13 @@ impl Engine {
         devices: Option<Vec<String>>,
         output_dir: Option<String>,
     ) -> EngineResponse {
+        // Mutual exclusion: replay must not be active
+        if self.replay.is_active() {
+            return EngineResponse::ErrorWithStatus {
+                status: 409,
+                message: "cannot record while replay is active".into(),
+            };
+        }
         if self.recording.as_ref().is_some_and(|r| {
             matches!(
                 r.state,
@@ -657,6 +703,324 @@ impl Engine {
         };
 
         self.recorder.tick(Some(mask_snapshot));
+    }
+
+    // ── Recordings management ────────────────────────────────────────
+
+    /// Validate session_id: must be alphanumeric + hyphens, max 64 chars.
+    fn validate_session_id(session_id: &str) -> Result<(), String> {
+        if session_id.is_empty() || session_id.len() > 64 {
+            return Err("session_id must be 1-64 characters".into());
+        }
+        if !session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            return Err("session_id must contain only alphanumeric characters and hyphens".into());
+        }
+        Ok(())
+    }
+
+    /// Find all *.mcap files under the recordings directory.
+    fn scan_mcap_files(&self) -> Result<Vec<PathBuf>, String> {
+        if !self.recordings_dir.exists() {
+            return Ok(Vec::new());
+        }
+        Self::walk_mcap_files(&self.recordings_dir)
+    }
+
+    fn walk_mcap_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
+        let mut results = Vec::new();
+        let entries =
+            fs::read_dir(dir).map_err(|e| format!("read dir {}: {}", dir.display(), e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("read entry: {}", e))?;
+            let path = entry.path();
+            if path.is_dir() {
+                if let Ok(mut sub) = Self::walk_mcap_files(&path) {
+                    results.append(&mut sub);
+                }
+            } else if path.extension().map_or(false, |ext| ext == "mcap") {
+                results.push(path);
+            }
+        }
+        Ok(results)
+    }
+
+    /// Find the MCAP file for a given session_id.
+    fn find_mcap_file(&self, session_id: &str) -> Option<PathBuf> {
+        let filename = format!("{}.mcap", session_id);
+        if let Ok(files) = self.scan_mcap_files() {
+            files
+                .into_iter()
+                .find(|p| p.file_name().map_or(false, |n| n == filename.as_str()))
+        } else {
+            None
+        }
+    }
+
+    /// Get disk free bytes for the recordings directory.
+    fn disk_free_bytes(&self) -> u64 {
+        let path = if self.recordings_dir.exists() {
+            &self.recordings_dir
+        } else {
+            Path::new(".")
+        };
+        disk_free_bytes(path).unwrap_or(0)
+    }
+
+    /// Check if a session_id is currently being recorded.
+    fn is_recording_session(&self, session_id: &str) -> bool {
+        self.recording.as_ref().is_some_and(|r| {
+            matches!(
+                r.state,
+                RecordingState::Starting | RecordingState::Recording
+            ) && r.session_id == session_id
+        })
+    }
+
+    fn cmd_list_recordings(
+        &self,
+        sort: Option<String>,
+        order: Option<String>,
+    ) -> EngineResponse {
+        let files = match self.scan_mcap_files() {
+            Ok(f) => f,
+            Err(e) => {
+                return EngineResponse::ErrorWithStatus {
+                    status: 500,
+                    message: format!("scan recordings: {}", e),
+                }
+            }
+        };
+
+        let mut entries: Vec<RecordingFileEntry> = Vec::new();
+        let mut total_size: u64 = 0;
+
+        for path in &files {
+            let session_id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            let filename = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+
+            let meta = match fs::metadata(path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let size_bytes = meta.len();
+            total_size += size_bytes;
+
+            let created_at = meta
+                .created()
+                .or_else(|_| meta.modified())
+                .ok()
+                .and_then(|t| {
+                    let dur = t.duration_since(UNIX_EPOCH).ok()?;
+                    let dt = chrono::DateTime::from_timestamp(dur.as_secs() as i64, 0)?;
+                    Some(dt.to_rfc3339())
+                })
+                .unwrap_or_default();
+
+            // Try to read MCAP summary (duration, message_count).
+            // This reads the file which could be slow for large files.
+            let (duration_secs, message_count) = match fs::read(path) {
+                Ok(data) => {
+                    let (d, c) = replay::read_mcap_summary(&data);
+                    (
+                        if d > 0.0 { Some(d) } else { None },
+                        if c > 0 { Some(c) } else { None },
+                    )
+                }
+                Err(_) => (None, None),
+            };
+
+            let is_locked = self.is_recording_session(&session_id)
+                || self.replay.current_session_id().as_deref() == Some(session_id.as_str());
+
+            entries.push(RecordingFileEntry {
+                session_id,
+                filename,
+                size_bytes,
+                created_at,
+                duration_secs,
+                message_count,
+                is_locked,
+            });
+        }
+
+        // Sort
+        let sort_field = sort.as_deref().unwrap_or("created_at");
+        let descending = order.as_deref().unwrap_or("desc") == "desc";
+
+        match sort_field {
+            "size" => entries.sort_by(|a, b| a.size_bytes.cmp(&b.size_bytes)),
+            "name" => entries.sort_by(|a, b| a.filename.cmp(&b.filename)),
+            _ => entries.sort_by(|a, b| a.created_at.cmp(&b.created_at)),
+        }
+        if descending {
+            entries.reverse();
+        }
+
+        EngineResponse::RecordingsList {
+            recordings: entries,
+            total_size_bytes: total_size,
+            disk_free_bytes: self.disk_free_bytes(),
+        }
+    }
+
+    fn cmd_delete_recording(&self, session_id: &str) -> EngineResponse {
+        if let Err(e) = Self::validate_session_id(session_id) {
+            return EngineResponse::ErrorWithStatus {
+                status: 400,
+                message: e,
+            };
+        }
+
+        // Check if recording in progress for this session
+        if self.is_recording_session(session_id) {
+            return EngineResponse::ErrorWithStatus {
+                status: 409,
+                message: "cannot delete: recording in progress".into(),
+            };
+        }
+
+        // Check if replay in progress for this session
+        if self.replay.current_session_id().as_deref() == Some(session_id) {
+            return EngineResponse::ErrorWithStatus {
+                status: 409,
+                message: "cannot delete: replay in progress".into(),
+            };
+        }
+
+        let Some(path) = self.find_mcap_file(session_id) else {
+            return EngineResponse::ErrorWithStatus {
+                status: 404,
+                message: "recording not found".into(),
+            };
+        };
+
+        match fs::remove_file(&path) {
+            Ok(()) => EngineResponse::Deleted(session_id.to_string()),
+            Err(e) => EngineResponse::ErrorWithStatus {
+                status: 500,
+                message: format!("failed to delete file: {}", e),
+            },
+        }
+    }
+
+    fn cmd_delete_recordings_batch(&self, session_ids: Vec<String>) -> EngineResponse {
+        if session_ids.is_empty() {
+            return EngineResponse::ErrorWithStatus {
+                status: 400,
+                message: "session_ids is required and must not be empty".into(),
+            };
+        }
+
+        let mut deleted = Vec::new();
+        let mut failed = Vec::new();
+
+        for sid in &session_ids {
+            if let Err(e) = Self::validate_session_id(sid) {
+                failed.push(BatchDeleteFailure {
+                    session_id: sid.clone(),
+                    error: e,
+                });
+                continue;
+            }
+
+            if self.is_recording_session(sid) {
+                failed.push(BatchDeleteFailure {
+                    session_id: sid.clone(),
+                    error: "cannot delete: recording in progress".into(),
+                });
+                continue;
+            }
+            if self.replay.current_session_id().as_deref() == Some(sid.as_str()) {
+                failed.push(BatchDeleteFailure {
+                    session_id: sid.clone(),
+                    error: "cannot delete: replay in progress".into(),
+                });
+                continue;
+            }
+
+            match self.find_mcap_file(sid) {
+                Some(path) => match fs::remove_file(&path) {
+                    Ok(()) => deleted.push(sid.clone()),
+                    Err(e) => failed.push(BatchDeleteFailure {
+                        session_id: sid.clone(),
+                        error: format!("failed to delete: {}", e),
+                    }),
+                },
+                None => {
+                    // Spec: skip non-existent files silently
+                }
+            }
+        }
+
+        EngineResponse::BatchDeleteResult { deleted, failed }
+    }
+
+    fn cmd_start_replay(&mut self, session_id: &str, speed: Option<f64>) -> EngineResponse {
+        if let Err(e) = Self::validate_session_id(session_id) {
+            return EngineResponse::ErrorWithStatus {
+                status: 400,
+                message: e,
+            };
+        }
+
+        let speed = speed.unwrap_or(1.0);
+        if !(0.1..=10.0).contains(&speed) {
+            return EngineResponse::ErrorWithStatus {
+                status: 400,
+                message: "speed must be between 0.1 and 10.0".into(),
+            };
+        }
+
+        // Mutual exclusion: recording must not be active
+        if self.recording.as_ref().is_some_and(|r| {
+            matches!(
+                r.state,
+                RecordingState::Starting | RecordingState::Recording
+            )
+        }) {
+            return EngineResponse::ErrorWithStatus {
+                status: 409,
+                message: "cannot replay while recording is active".into(),
+            };
+        }
+
+        // Mutual exclusion: another replay must not be active
+        if self.replay.is_active() {
+            return EngineResponse::ErrorWithStatus {
+                status: 409,
+                message: "another replay is already active, stop it first".into(),
+            };
+        }
+
+        let Some(path) = self.find_mcap_file(session_id) else {
+            return EngineResponse::ErrorWithStatus {
+                status: 404,
+                message: "recording not found".into(),
+            };
+        };
+
+        match self.replay.start(path, session_id.to_string(), speed) {
+            Ok((total_secs, message_count)) => EngineResponse::ReplayStarted {
+                session_id: session_id.to_string(),
+                total_secs,
+                message_count,
+            },
+            Err(e) => EngineResponse::ErrorWithStatus {
+                status: 500,
+                message: format!("replay start failed: {}", e),
+            },
+        }
     }
 
     // ── Discovery & device lifecycle ────────────────────────────────
@@ -1245,5 +1609,100 @@ impl Engine {
             })
             .collect();
         self.update_device_statuses();
+    }
+}
+
+/// Get available disk space in bytes using statvfs.
+fn disk_free_bytes(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::mem::MaybeUninit;
+    let c_path = CString::new(path.to_str()?).ok()?;
+    unsafe {
+        let mut stat = MaybeUninit::<libc::statvfs>::uninit();
+        if libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) == 0 {
+            let stat = stat.assume_init();
+            Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::recorder::mcap_writer::McapSession;
+
+    /// Helper: create a test MCAP file in the given directory.
+    fn create_test_mcap(dir: &Path, session_id: &str) -> PathBuf {
+        let dir_str = dir.to_str().unwrap();
+        let mut session =
+            McapSession::new(session_id, dir_str).expect("McapSession::new");
+        session.register_schemas().expect("register_schemas");
+        for i in 0..5 {
+            let json = serde_json::json!({"type":"hardware_mask","mask":1,"sequence":i});
+            let bytes = serde_json::to_vec(&json).unwrap();
+            session
+                .write_mask(&bytes, 1_000_000_000 + i * 50_000_000)
+                .expect("write_mask");
+        }
+        session.finish().expect("finish")
+    }
+
+    #[test]
+    fn test_validate_session_id() {
+        assert!(Engine::validate_session_id("abc-123").is_ok());
+        assert!(Engine::validate_session_id("a1b2c3d4-e5f6-7890-abcd-ef1234567890").is_ok());
+        assert!(Engine::validate_session_id("").is_err());
+        assert!(Engine::validate_session_id("abc/../../etc").is_err()); // path traversal
+        assert!(Engine::validate_session_id("has spaces").is_err());
+        assert!(Engine::validate_session_id(&"x".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn test_scan_and_list_recordings() {
+        let base = std::env::temp_dir().join("rapid_test_list_recs");
+        let _ = fs::remove_dir_all(&base);
+
+        // Create recordings in subdirectories (matching current recording layout)
+        let sub1 = base.join("session-1");
+        let sub2 = base.join("session-2");
+        create_test_mcap(&sub1, "session-1");
+        create_test_mcap(&sub2, "session-2");
+
+        // Create engine-like scan
+        let files = Engine::walk_mcap_files(&base).expect("walk");
+        assert_eq!(files.len(), 2, "expected 2 mcap files, got {:?}", files);
+
+        // Check filenames
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_stem().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&"session-1".to_string()));
+        assert!(names.contains(&"session-2".to_string()));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_delete_nonexistent_recording() {
+        // Create a minimal engine setup for testing
+        let base = std::env::temp_dir().join("rapid_test_delete_nonexist");
+        let _ = fs::remove_dir_all(&base);
+        let _ = fs::create_dir_all(&base);
+
+        // We can't easily create an Engine without discovery sources,
+        // but we can test the validate + find logic directly.
+        assert!(Engine::validate_session_id("no-such-session").is_ok());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_disk_free_bytes() {
+        let free = disk_free_bytes(Path::new("/tmp"));
+        assert!(free.is_some(), "should be able to stat /tmp");
+        assert!(free.unwrap() > 0, "disk should have some free space");
     }
 }

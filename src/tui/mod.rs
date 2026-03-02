@@ -324,6 +324,7 @@ impl App {
             Ok(EngineResponse::Error(e)) => self.set_status(format!("Stop replay: {}", e)),
             _ => self.set_status("Stop replay: engine error".into()),
         }
+        self.refresh_replay_status();
     }
 
     fn refresh_replay_status(&mut self) {

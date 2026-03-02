@@ -4,6 +4,7 @@ pub mod command;
 pub mod recorder;
 pub mod recording;
 pub mod replay;
+pub mod topic_bus;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -27,6 +28,7 @@ use command::{
 use recorder::RecorderCore;
 use recording::{RecordingSession, RecordingState};
 use replay::ReplayManager;
+use topic_bus::TopicBus;
 
 /// Running process information.
 struct RunningProcess {
@@ -103,6 +105,9 @@ pub struct Engine {
     // MCAP recorder
     recorder: RecorderCore,
 
+    // ZMQ topic bus
+    topic_bus: TopicBus,
+
     // MCAP replay
     replay: ReplayManager,
 
@@ -173,6 +178,9 @@ impl Engine {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("recordings");
 
+        let topic_bus = TopicBus::new("tcp://0.0.0.0:5560".into());
+        let replay = ReplayManager::new(topic_bus.sender(), topic_bus.runtime_handle());
+
         Engine {
             registry,
             layout,
@@ -195,7 +203,8 @@ impl Engine {
             last_status_refresh: Instant::now(),
             recording: None,
             recorder: RecorderCore::new(),
-            replay: ReplayManager::new("tcp://0.0.0.0:5560".into()),
+            topic_bus,
+            replay,
             recordings_dir,
             pending_restarts: Vec::new(),
             cmd_rx,

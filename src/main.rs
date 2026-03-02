@@ -81,6 +81,22 @@ enum Commands {
         #[command(subcommand)]
         action: MaskLayoutAction,
     },
+    /// Subscribe to ZMQ replay stream and print messages
+    #[command(visible_alias = "rl", hide = true)]
+    ReplayListen {
+        /// ZMQ endpoint (default: tcp://127.0.0.1:5560)
+        #[arg(long, default_value = "tcp://127.0.0.1:5560")]
+        zmq: String,
+        /// Only show topics containing this substring
+        #[arg(long)]
+        topic_filter: Option<String>,
+    },
+    /// Topic introspection tools
+    #[command(visible_alias = "t")]
+    Topics {
+        #[command(subcommand)]
+        action: TopicsAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -99,6 +115,38 @@ enum MaskLayoutAction {
     },
     /// Reset to alphabetical order
     Reset,
+}
+
+#[derive(Subcommand)]
+enum TopicsAction {
+    /// List all active topics
+    List {
+        /// ZMQ endpoint
+        #[arg(long, default_value = "tcp://127.0.0.1:5560")]
+        zmq: String,
+    },
+    /// Print messages on a topic
+    Echo {
+        /// Topic name (e.g. /heartbeat)
+        topic: String,
+        /// ZMQ endpoint
+        #[arg(long, default_value = "tcp://127.0.0.1:5560")]
+        zmq: String,
+        /// Print raw bytes instead of JSON
+        #[arg(long)]
+        raw: bool,
+    },
+    /// Measure publish frequency of a topic
+    Hz {
+        /// Topic name
+        topic: String,
+        /// ZMQ endpoint
+        #[arg(long, default_value = "tcp://127.0.0.1:5560")]
+        zmq: String,
+        /// Rolling window in seconds
+        #[arg(long, default_value = "5")]
+        window: u64,
+    },
 }
 
 fn main() {
@@ -124,6 +172,8 @@ fn main() {
             follow,
         } => cmd_logs(name, lines, follow),
         Commands::MaskLayout { action } => cmd_mask_layout(action),
+        Commands::ReplayListen { zmq, topic_filter } => cmd_replay_listen(&zmq, topic_filter),
+        Commands::Topics { action } => cmd_topics(action),
     }
 }
 
@@ -1135,4 +1185,341 @@ fn cmd_mask_layout(action: MaskLayoutAction) {
             }
         }
     }
+}
+
+fn cmd_replay_listen(endpoint: &str, topic_filter: Option<String>) {
+    use std::collections::HashMap;
+    use zeromq::{Socket, SocketRecv, SubSocket};
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+
+    let endpoint = endpoint.to_string();
+    rt.block_on(async {
+        // Global counters (across all sessions)
+        let mut topic_counts: HashMap<String, u64> = HashMap::new();
+        let mut total: u64 = 0;
+        // Per-session counters
+        let mut session_count: u64 = 0;
+        let mut session_topic_counts: HashMap<String, u64> = HashMap::new();
+
+        let start = std::time::Instant::now();
+
+        let mut socket = SubSocket::new();
+        socket.subscribe("").await.unwrap_or_else(|e| {
+            eprintln!("subscribe error: {}", e);
+        });
+
+        if let Err(e) = socket.connect(&endpoint).await {
+            eprintln!("Failed to connect to {}: {}", endpoint, e);
+            std::process::exit(1);
+        }
+        println!("Connected to {}, waiting for messages...", endpoint);
+
+        loop {
+            tokio::select! {
+                result = socket.recv() => {
+                    match result {
+                        Ok(msg) => {
+                            let frames: Vec<Vec<u8>> = msg
+                                .into_vec()
+                                .into_iter()
+                                .map(|f| f.to_vec())
+                                .collect();
+
+                            let (topic, payload) = if frames.len() >= 2 {
+                                let t = String::from_utf8_lossy(&frames[0]).to_string();
+                                (t, &frames[1] as &[u8])
+                            } else if frames.len() == 1 {
+                                ("(none)".to_string(), &frames[0] as &[u8])
+                            } else {
+                                continue;
+                            };
+
+                            // Handle /replay/status control frames
+                            if topic == "/replay/status" {
+                                if let Ok(ctrl) = serde_json::from_slice::<serde_json::Value>(payload) {
+                                    match ctrl.get("event").and_then(|v| v.as_str()) {
+                                        Some("start") => {
+                                            let sid = ctrl.get("session_id").and_then(|v| v.as_str()).unwrap_or("?");
+                                            let secs = ctrl.get("total_secs").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                            let msgs = ctrl.get("message_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                                            let spd = ctrl.get("speed").and_then(|v| v.as_f64()).unwrap_or(1.0);
+                                            println!("\n=== replay start: session={}, {:.1}s, {} messages, speed={:.1}x ===",
+                                                sid, secs, msgs, spd);
+                                            session_count = 0;
+                                            session_topic_counts.clear();
+                                        }
+                                        Some("stop") => {
+                                            let sid = ctrl.get("session_id").and_then(|v| v.as_str()).unwrap_or("?");
+                                            println!("\n=== replay stop: session={}, {} messages in session ===", sid, session_count);
+                                            if !session_topic_counts.is_empty() {
+                                                let mut sorted: Vec<_> = session_topic_counts.iter().collect();
+                                                sorted.sort_by_key(|(k, _)| (*k).clone());
+                                                for (t, c) in &sorted {
+                                                    println!("    {}: {}", t, c);
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                continue;
+                            }
+
+                            total += 1;
+                            session_count += 1;
+                            *topic_counts.entry(topic.clone()).or_insert(0) += 1;
+                            *session_topic_counts.entry(topic.clone()).or_insert(0) += 1;
+
+                            if let Some(ref filter) = topic_filter {
+                                if !topic.contains(filter.as_str()) {
+                                    continue;
+                                }
+                            }
+
+                            let summary = match serde_json::from_slice::<serde_json::Value>(payload) {
+                                Ok(serde_json::Value::Object(map)) => {
+                                    let keys: Vec<_> = map.keys().take(4).collect();
+                                    keys.iter()
+                                        .map(|k| {
+                                            let v = &map[k.as_str()];
+                                            let val = match v {
+                                                serde_json::Value::Object(_) => "{...}".to_string(),
+                                                serde_json::Value::Array(a) => format!("[{} items]", a.len()),
+                                                other => {
+                                                    let s = other.to_string();
+                                                    if s.len() > 40 { format!("{}...", &s[..40]) } else { s }
+                                                }
+                                            };
+                                            format!("{}={}", k, val)
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                }
+                                _ => format!("{} bytes", payload.len()),
+                            };
+
+                            println!("[{:>6}] {:30} | {}", session_count, topic, summary);
+                        }
+                        Err(e) => {
+                            eprintln!("recv error: {}", e);
+                            break;
+                        }
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    println!("\n{}", "=".repeat(50));
+                    println!("  Statistics ({:.1}s)", elapsed);
+                    println!("{}", "=".repeat(50));
+                    println!("  Total messages: {}", total);
+                    let mut sorted_topics: Vec<_> = topic_counts.iter().collect();
+                    sorted_topics.sort_by_key(|(k, _)| (*k).clone());
+                    for (topic, count) in &sorted_topics {
+                        println!("    {}: {}", topic, count);
+                    }
+                    println!("{}", "=".repeat(50));
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn cmd_topics(action: TopicsAction) {
+    match action {
+        TopicsAction::List { zmq } => cmd_topics_list(&zmq),
+        TopicsAction::Echo { topic, zmq, raw } => cmd_topics_echo(&zmq, &topic, raw),
+        TopicsAction::Hz { topic, zmq, window } => cmd_topics_hz(&zmq, &topic, window),
+    }
+}
+
+fn cmd_topics_list(endpoint: &str) {
+    use zeromq::{Socket, SocketRecv, SubSocket};
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+
+    let endpoint = endpoint.to_string();
+    rt.block_on(async {
+        let mut socket = SubSocket::new();
+        socket.subscribe("/topics/list").await.unwrap_or_else(|e| {
+            eprintln!("subscribe error: {}", e);
+        });
+
+        if let Err(e) = socket.connect(&endpoint).await {
+            eprintln!("Failed to connect to {}: {}", endpoint, e);
+            std::process::exit(1);
+        }
+
+        // Wait for one catalog message (5s timeout)
+        tokio::select! {
+            result = socket.recv() => {
+                match result {
+                    Ok(msg) => {
+                        let frames: Vec<Vec<u8>> = msg.into_vec().into_iter().map(|f| f.to_vec()).collect();
+                        let payload = if frames.len() >= 2 { &frames[1] } else if frames.len() == 1 { &frames[0] } else {
+                            eprintln!("empty message");
+                            return;
+                        };
+                        match serde_json::from_slice::<Vec<serde_json::Value>>(payload) {
+                            Ok(topics) => {
+                                println!("{:<30} {:>8} {:>8}", "TOPIC", "COUNT", "HZ");
+                                println!("{}", "-".repeat(48));
+                                for t in &topics {
+                                    let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let count = t.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    let hz = t.get("hz").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                    println!("{:<30} {:>8} {:>8.1}", name, count, hz);
+                                }
+                            }
+                            Err(e) => eprintln!("failed to parse catalog: {}", e),
+                        }
+                    }
+                    Err(e) => eprintln!("recv error: {}", e),
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                eprintln!("timeout: no catalog received within 5s (is the engine running?)");
+            }
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    });
+}
+
+fn cmd_topics_echo(endpoint: &str, topic: &str, raw: bool) {
+    use zeromq::{Socket, SocketRecv, SubSocket};
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+
+    let endpoint = endpoint.to_string();
+    let topic = topic.to_string();
+    rt.block_on(async {
+        let mut socket = SubSocket::new();
+        socket.subscribe(&topic).await.unwrap_or_else(|e| {
+            eprintln!("subscribe error: {}", e);
+        });
+
+        if let Err(e) = socket.connect(&endpoint).await {
+            eprintln!("Failed to connect to {}: {}", endpoint, e);
+            std::process::exit(1);
+        }
+        eprintln!("Subscribed to '{}' on {}", topic, endpoint);
+
+        let mut count: u64 = 0;
+        let start = std::time::Instant::now();
+
+        loop {
+            tokio::select! {
+                result = socket.recv() => {
+                    match result {
+                        Ok(msg) => {
+                            let frames: Vec<Vec<u8>> = msg.into_vec().into_iter().map(|f| f.to_vec()).collect();
+                            let (recv_topic, payload) = if frames.len() >= 2 {
+                                (String::from_utf8_lossy(&frames[0]).to_string(), frames[1].clone())
+                            } else if frames.len() == 1 {
+                                (topic.clone(), frames[0].clone())
+                            } else {
+                                continue;
+                            };
+
+                            count += 1;
+
+                            if raw {
+                                println!("[{}] {} bytes", recv_topic, payload.len());
+                            } else {
+                                match serde_json::from_slice::<serde_json::Value>(&payload) {
+                                    Ok(val) => println!("[{}] {}", recv_topic, val),
+                                    Err(_) => println!("[{}] {} bytes (not JSON)", recv_topic, payload.len()),
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("recv error: {}", e);
+                            break;
+                        }
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    eprintln!("\n--- {} messages in {:.1}s ({:.1} msg/s) ---",
+                        count, elapsed, if elapsed > 0.0 { count as f64 / elapsed } else { 0.0 });
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn cmd_topics_hz(endpoint: &str, topic: &str, window_secs: u64) {
+    use zeromq::{Socket, SocketRecv, SubSocket};
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+
+    let endpoint = endpoint.to_string();
+    let topic = topic.to_string();
+    let window = std::time::Duration::from_secs(window_secs);
+
+    rt.block_on(async {
+        let mut socket = SubSocket::new();
+        socket.subscribe(&topic).await.unwrap_or_else(|e| {
+            eprintln!("subscribe error: {}", e);
+        });
+
+        if let Err(e) = socket.connect(&endpoint).await {
+            eprintln!("Failed to connect to {}: {}", endpoint, e);
+            std::process::exit(1);
+        }
+        eprintln!("Measuring Hz for '{}' (window={}s)", topic, window_secs);
+
+        let mut timestamps: Vec<std::time::Instant> = Vec::new();
+        let mut last_print = std::time::Instant::now();
+
+        loop {
+            tokio::select! {
+                result = socket.recv() => {
+                    match result {
+                        Ok(_) => {
+                            let now = std::time::Instant::now();
+                            timestamps.push(now);
+                            let cutoff = now - window;
+                            timestamps.retain(|t| *t >= cutoff);
+
+                            // Print at ~1Hz
+                            if last_print.elapsed() >= std::time::Duration::from_secs(1) {
+                                let hz = if timestamps.len() >= 2 {
+                                    let span = now.duration_since(timestamps[0]).as_secs_f64();
+                                    if span > 0.001 { timestamps.len() as f64 / span } else { 0.0 }
+                                } else {
+                                    0.0
+                                };
+                                eprint!("\r{}: {:.1} Hz ({} msgs in window)    ",
+                                    topic, hz, timestamps.len());
+                                last_print = now;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("\nrecv error: {}", e);
+                            break;
+                        }
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    eprintln!();
+                    break;
+                }
+            }
+        }
+    });
 }

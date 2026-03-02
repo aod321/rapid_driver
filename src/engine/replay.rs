@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::engine::command::{ReplayState, ReplayStatusInfo};
+use crate::engine::topic_bus::{TopicBusMessage, TopicBusTx};
 
 /// Internal shared replay progress state.
 struct ReplayProgress {
@@ -18,25 +19,18 @@ struct ReplayProgress {
     cancel: bool,
 }
 
-/// Manages MCAP replay lifecycle with a dedicated tokio runtime.
+/// Manages MCAP replay lifecycle using a shared TopicBus.
 pub struct ReplayManager {
-    rt: tokio::runtime::Runtime,
+    rt_handle: tokio::runtime::Handle,
     progress: Arc<Mutex<ReplayProgress>>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
-    zmq_endpoint: String,
+    bus_tx: TopicBusTx,
 }
 
 impl ReplayManager {
-    pub fn new(zmq_endpoint: String) -> Self {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .thread_name("replay")
-            .build()
-            .expect("failed to build replay tokio runtime");
-
+    pub fn new(bus_tx: TopicBusTx, rt_handle: tokio::runtime::Handle) -> Self {
         ReplayManager {
-            rt,
+            rt_handle,
             progress: Arc::new(Mutex::new(ReplayProgress {
                 state: ReplayState::Idle,
                 session_id: None,
@@ -48,7 +42,7 @@ impl ReplayManager {
                 cancel: false,
             })),
             task_handle: None,
-            zmq_endpoint,
+            bus_tx,
         }
     }
 
@@ -100,11 +94,24 @@ impl ReplayManager {
             p.cancel = false;
         }
 
+        // Send start control frame
+        let ctrl = serde_json::json!({
+            "event": "start",
+            "session_id": session_id,
+            "total_secs": total_secs,
+            "message_count": message_count,
+            "speed": speed,
+        });
+        let _ = self.bus_tx.try_send(TopicBusMessage::Data {
+            topic: "/replay/status".into(),
+            payload: serde_json::to_vec(&ctrl).unwrap(),
+        });
+
         // Spawn async replay task
         let progress = self.progress.clone();
-        let endpoint = self.zmq_endpoint.clone();
-        let handle = self.rt.spawn(async move {
-            replay_task(data, progress, speed, endpoint).await;
+        let tx = self.bus_tx.clone();
+        let handle = self.rt_handle.spawn(async move {
+            replay_task(data, progress, speed, tx).await;
         });
         self.task_handle = Some(handle);
 
@@ -118,6 +125,7 @@ impl ReplayManager {
 
     /// Stop the current replay. Idempotent.
     pub fn stop(&mut self) {
+        let session_id;
         {
             let mut p = self.progress.lock().unwrap();
             if !matches!(p.state, ReplayState::Starting | ReplayState::Running) {
@@ -126,6 +134,7 @@ impl ReplayManager {
                 p.session_id = None;
                 return;
             }
+            session_id = p.session_id.clone();
             p.state = ReplayState::Stopping;
             p.cancel = true;
         }
@@ -133,6 +142,16 @@ impl ReplayManager {
         if let Some(handle) = self.task_handle.take() {
             handle.abort();
         }
+
+        // Send stop control frame (socket is still alive, so this will be delivered)
+        let ctrl = serde_json::json!({
+            "event": "stop",
+            "session_id": session_id,
+        });
+        let _ = self.bus_tx.try_send(TopicBusMessage::Data {
+            topic: "/replay/status".into(),
+            payload: serde_json::to_vec(&ctrl).unwrap(),
+        });
 
         {
             let mut p = self.progress.lock().unwrap();
@@ -200,24 +219,8 @@ async fn replay_task(
     data: Vec<u8>,
     progress: Arc<Mutex<ReplayProgress>>,
     speed: f64,
-    zmq_endpoint: String,
+    tx: TopicBusTx,
 ) {
-    use bytes::Bytes;
-    use zeromq::{PubSocket, Socket, SocketSend};
-
-    // Create ZMQ PUB socket
-    let mut socket = PubSocket::new();
-    if let Err(e) = socket.bind(&zmq_endpoint).await {
-        eprintln!("[replay] failed to bind ZMQ PUB to {}: {}", zmq_endpoint, e);
-        let mut p = progress.lock().unwrap();
-        p.state = ReplayState::Error;
-        p.error = Some(format!("zmq bind failed: {}", e));
-        return;
-    }
-
-    // Give subscribers a moment to connect
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
     // Collect all messages with their timestamps and topics
     let messages: Vec<(u64, String, Vec<u8>)> = match mcap::MessageStream::new(&data) {
         Ok(stream) => stream
@@ -246,6 +249,9 @@ async fn replay_task(
         p.state = ReplayState::Running;
     }
 
+    // Slow-joiner mitigation: give subscribers time to connect
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
     let first_time = messages[0].0;
     let last_time = messages.last().map(|m| m.0).unwrap_or(first_time);
     let total_ns = last_time.saturating_sub(first_time);
@@ -269,10 +275,13 @@ async fn replay_task(
             }
         }
 
-        // Send to ZMQ as two-frame message: [topic, payload]
-        let mut zmq_msg = zeromq::ZmqMessage::from(Bytes::from(topic.as_bytes().to_vec()));
-        zmq_msg.push_back(Bytes::from(payload.clone()));
-        let _ = socket.send(zmq_msg).await;
+        // Send to ZMQ via TopicBus
+        let _ = tx
+            .send(TopicBusMessage::Data {
+                topic: topic.clone(),
+                payload: payload.clone(),
+            })
+            .await;
 
         // Update progress
         let elapsed = started.elapsed();
@@ -299,6 +308,7 @@ async fn replay_task(
 mod tests {
     use super::*;
     use crate::engine::recorder::mcap_writer::McapSession;
+    use crate::engine::topic_bus::TopicBus;
 
     /// Helper: create a test MCAP file with some mask messages.
     fn create_test_mcap(dir: &std::path::Path, session_id: &str) -> PathBuf {
@@ -338,7 +348,8 @@ mod tests {
 
     #[test]
     fn test_replay_manager_status_idle() {
-        let mgr = ReplayManager::new("tcp://127.0.0.1:15560".into());
+        let bus = TopicBus::new("tcp://127.0.0.1:15560".into());
+        let mgr = ReplayManager::new(bus.sender(), bus.runtime_handle());
         let status = mgr.status();
         assert!(!status.active);
         assert_eq!(status.state, ReplayState::Idle);
@@ -352,7 +363,8 @@ mod tests {
 
         let path = create_test_mcap(&dir, "test_replay");
 
-        let mut mgr = ReplayManager::new("tcp://127.0.0.1:15561".into());
+        let bus = TopicBus::new("tcp://127.0.0.1:15561".into());
+        let mut mgr = ReplayManager::new(bus.sender(), bus.runtime_handle());
         let result = mgr.start(path, "test_replay".into(), 10.0);
         assert!(result.is_ok(), "start failed: {:?}", result);
 
@@ -379,7 +391,8 @@ mod tests {
 
     #[test]
     fn test_replay_nonexistent_file() {
-        let mut mgr = ReplayManager::new("tcp://127.0.0.1:15562".into());
+        let bus = TopicBus::new("tcp://127.0.0.1:15562".into());
+        let mut mgr = ReplayManager::new(bus.sender(), bus.runtime_handle());
         let result = mgr.start("/nonexistent/path.mcap".into(), "bad".into(), 1.0);
         assert!(result.is_err());
     }

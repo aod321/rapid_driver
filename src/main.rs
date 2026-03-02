@@ -194,13 +194,19 @@ fn advertise_rapiddriver_api(port: u16) -> Option<MdnsAdvertiseHandle> {
         .arg("_rapiddriver._tcp")
         .arg(".")
         .arg(port.to_string())
+        .arg("zmq_port=5560")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
 
     #[cfg(target_os = "linux")]
     let result = std::process::Command::new("avahi-publish-service")
-        .args(["rapid-driver", "_rapiddriver._tcp", &port.to_string()])
+        .args([
+            "rapid-driver",
+            "_rapiddriver._tcp",
+            &port.to_string(),
+            "zmq_port=5560",
+        ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();

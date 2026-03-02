@@ -202,6 +202,7 @@ async fn replay_task(
     speed: f64,
     zmq_endpoint: String,
 ) {
+    use bytes::Bytes;
     use zeromq::{PubSocket, Socket, SocketSend};
 
     // Create ZMQ PUB socket
@@ -217,11 +218,11 @@ async fn replay_task(
     // Give subscribers a moment to connect
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    // Collect all messages with their timestamps
-    let messages: Vec<(u64, Vec<u8>)> = match mcap::MessageStream::new(&data) {
+    // Collect all messages with their timestamps and topics
+    let messages: Vec<(u64, String, Vec<u8>)> = match mcap::MessageStream::new(&data) {
         Ok(stream) => stream
             .filter_map(|r| r.ok())
-            .map(|msg| (msg.log_time, msg.data.to_vec()))
+            .map(|msg| (msg.log_time, msg.channel.topic.clone(), msg.data.to_vec()))
             .collect(),
         Err(e) => {
             eprintln!("[replay] failed to parse mcap: {}", e);
@@ -246,11 +247,11 @@ async fn replay_task(
     }
 
     let first_time = messages[0].0;
-    let last_time = messages.last().unwrap().0;
+    let last_time = messages.last().map(|m| m.0).unwrap_or(first_time);
     let total_ns = last_time.saturating_sub(first_time);
     let started = Instant::now();
 
-    for (i, (log_time, payload)) in messages.iter().enumerate() {
+    for (i, (log_time, topic, payload)) in messages.iter().enumerate() {
         // Check cancellation
         {
             let p = progress.lock().unwrap();
@@ -268,8 +269,9 @@ async fn replay_task(
             }
         }
 
-        // Send to ZMQ
-        let zmq_msg = zeromq::ZmqMessage::from(payload.clone());
+        // Send to ZMQ as two-frame message: [topic, payload]
+        let mut zmq_msg = zeromq::ZmqMessage::from(Bytes::from(topic.as_bytes().to_vec()));
+        zmq_msg.push_back(Bytes::from(payload.clone()));
         let _ = socket.send(zmq_msg).await;
 
         // Update progress

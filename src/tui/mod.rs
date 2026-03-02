@@ -5,7 +5,8 @@
 mod events;
 
 use crate::engine::command::{
-    DeviceStatus, EngineCommand, EngineHandle, EngineResponse, RecordingInfo,
+    DeviceStatus, EngineCommand, EngineHandle, EngineResponse, RecordingFileEntry, RecordingInfo,
+    ReplayState, ReplayStatusInfo,
 };
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
@@ -37,6 +38,7 @@ pub enum AppMode {
     Reorder,
     Export,
     Import,
+    Replay,
 }
 
 /// Application state — thin UI wrapper around EngineHandle.
@@ -53,6 +55,11 @@ pub struct App {
     pub measured_freq: f64,
     pub mask_enabled: bool,
     pub recording: Option<RecordingInfo>,
+
+    // Replay state
+    pub replay_recordings: Vec<RecordingFileEntry>,
+    pub replay_selected: usize,
+    pub replay_status: Option<ReplayStatusInfo>,
 
     // Engine handle
     handle: EngineHandle,
@@ -97,6 +104,9 @@ impl App {
             measured_freq,
             mask_enabled: resolved_mask_enabled,
             recording,
+            replay_recordings: Vec::new(),
+            replay_selected: 0,
+            replay_status: None,
             handle,
             log_dir,
             log_cache: HashMap::new(),
@@ -136,6 +146,7 @@ impl App {
             self.mask_enabled = status.mask_enabled;
             self.recording = status.recording;
         }
+        self.refresh_replay_status();
     }
 
     fn set_status(&mut self, msg: String) {
@@ -269,6 +280,63 @@ impl App {
         }
     }
 
+    fn fetch_recordings(&mut self) {
+        match self.handle.request(EngineCommand::ListRecordings {
+            sort: Some("created_at".into()),
+            order: Some("desc".into()),
+        }) {
+            Ok(EngineResponse::RecordingsList { recordings, .. }) => {
+                self.replay_recordings = recordings;
+                self.replay_selected = 0;
+            }
+            Ok(EngineResponse::Error(e)) => {
+                self.set_status(format!("List recordings: {}", e));
+                self.replay_recordings.clear();
+            }
+            _ => {
+                self.set_status("Failed to list recordings".into());
+                self.replay_recordings.clear();
+            }
+        }
+    }
+
+    fn start_replay(&mut self) {
+        let Some(entry) = self.replay_recordings.get(self.replay_selected) else {
+            return;
+        };
+        let session_id = entry.session_id.clone();
+        match self.handle.request(EngineCommand::StartReplay {
+            session_id: session_id.clone(),
+            speed: Some(1.0),
+        }) {
+            Ok(EngineResponse::ReplayStarted { .. }) => {
+                self.set_status(format!("Replay started: {}", session_id));
+                self.mode = AppMode::Monitor;
+            }
+            Ok(EngineResponse::Error(e)) => self.set_status(format!("Replay: {}", e)),
+            _ => self.set_status("Replay: engine error".into()),
+        }
+    }
+
+    fn stop_replay(&mut self) {
+        match self.handle.request(EngineCommand::StopReplay) {
+            Ok(EngineResponse::Ok) => self.set_status("Replay stopped".into()),
+            Ok(EngineResponse::Error(e)) => self.set_status(format!("Stop replay: {}", e)),
+            _ => self.set_status("Stop replay: engine error".into()),
+        }
+    }
+
+    fn refresh_replay_status(&mut self) {
+        match self.handle.request(EngineCommand::GetReplayStatus) {
+            Ok(EngineResponse::ReplayStatus(info)) => {
+                self.replay_status = Some(info);
+            }
+            _ => {
+                self.replay_status = None;
+            }
+        }
+    }
+
     fn update_log_cache(&mut self, device_name: &str) {
         let log_path = self.log_dir.join(format!("{}.log", device_name));
         if let Ok(file) = File::open(&log_path) {
@@ -385,6 +453,20 @@ fn handle_key(app: &mut App, key: KeyCode) -> AppEvent {
                 app.toggle_recording();
                 AppEvent::Continue
             }
+            KeyCode::Char('P') => {
+                // If replay is active, stop it; otherwise enter replay selection mode
+                let is_replay_active = app
+                    .replay_status
+                    .as_ref()
+                    .is_some_and(|s| matches!(s.state, ReplayState::Starting | ReplayState::Running));
+                if is_replay_active {
+                    app.stop_replay();
+                } else {
+                    app.fetch_recordings();
+                    app.mode = AppMode::Replay;
+                }
+                AppEvent::Continue
+            }
             KeyCode::Char('s') | KeyCode::Enter => {
                 app.restart_selected();
                 AppEvent::Continue
@@ -419,6 +501,29 @@ fn handle_key(app: &mut App, key: KeyCode) -> AppEvent {
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 app.move_selected_down();
+                AppEvent::Continue
+            }
+            _ => AppEvent::Continue,
+        },
+        AppMode::Replay => match key {
+            KeyCode::Esc => {
+                app.mode = AppMode::Monitor;
+                AppEvent::Continue
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if app.replay_selected > 0 {
+                    app.replay_selected -= 1;
+                }
+                AppEvent::Continue
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if app.replay_selected < app.replay_recordings.len().saturating_sub(1) {
+                    app.replay_selected += 1;
+                }
+                AppEvent::Continue
+            }
+            KeyCode::Enter => {
+                app.start_replay();
                 AppEvent::Continue
             }
             _ => AppEvent::Continue,
@@ -494,6 +599,19 @@ fn ui(f: &mut Frame, app: &App) {
         }
     }
 
+    // Show replay indicator
+    if let Some(ref rs) = app.replay_status {
+        if matches!(rs.state, ReplayState::Starting | ReplayState::Running) {
+            let sid = rs.session_id.as_deref().unwrap_or("?");
+            let short_id = if sid.len() > 8 { &sid[..8] } else { sid };
+            header_spans.push(Span::raw(" | "));
+            header_spans.push(Span::styled(
+                format!(" \u{25b6} REPLAY {} ", short_id),
+                Style::default().fg(Color::White).bg(Color::Magenta),
+            ));
+        }
+    }
+
     let header =
         Paragraph::new(Line::from(header_spans)).block(Block::default().borders(Borders::ALL));
     f.render_widget(header, chunks[0]);
@@ -504,14 +622,19 @@ fn ui(f: &mut Frame, app: &App) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(chunks[1]);
 
-    // Left side: Devices + Recorder
+    // Left side: Devices + Recorder + Replay
     let left_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(8)])
+        .constraints([
+            Constraint::Min(5),
+            Constraint::Length(8),
+            Constraint::Length(6),
+        ])
         .split(main_chunks[0]);
 
     render_device_list(f, app, left_chunks[0]);
     render_recorder_panel(f, app, left_chunks[1]);
+    render_replay_panel(f, app, left_chunks[2]);
 
     // Right side: Mask + Log
     let right_chunks = Layout::default()
@@ -524,10 +647,11 @@ fn ui(f: &mut Frame, app: &App) {
 
     // Footer
     let help_text = match app.mode {
-        AppMode::Monitor => "[q]uit [s/Enter]restart [r]eorder [e]xport [i]mport [R]ec [↑↓]select",
+        AppMode::Monitor => "[q]uit [s/Enter]restart [r]eorder [e]xport [i]mport [R]ec [P]replay [↑↓]select",
         AppMode::Reorder => "[↑↓]move [Enter]save [Esc]cancel",
         AppMode::Export => "Enter path to export: ",
         AppMode::Import => "Enter path to import: ",
+        AppMode::Replay => "[↑↓]select [Enter]start [Esc]back",
     };
 
     let footer_content = if matches!(app.mode, AppMode::Export | AppMode::Import) {
@@ -780,4 +904,104 @@ fn render_recorder_panel(f: &mut Frame, app: &App, area: Rect) {
 
     let paragraph = Paragraph::new(lines).block(block);
     f.render_widget(paragraph, area);
+}
+
+fn render_replay_panel(f: &mut Frame, app: &App, area: Rect) {
+    let mut lines: Vec<Line> = Vec::new();
+
+    if app.mode == AppMode::Replay {
+        // Show recording list for selection
+        if app.replay_recordings.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  (no recordings found)",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            let max_visible = area.height.saturating_sub(2) as usize; // borders
+            let start = app
+                .replay_selected
+                .saturating_sub(max_visible.saturating_sub(1));
+            for (i, entry) in app
+                .replay_recordings
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(max_visible)
+            {
+                let short_id = if entry.session_id.len() > 12 {
+                    &entry.session_id[..12]
+                } else {
+                    &entry.session_id
+                };
+                let dur = entry
+                    .duration_secs
+                    .map(|d| format!("{:.0}s", d))
+                    .unwrap_or_else(|| "?".into());
+                let text = format!(" {} ({})", short_id, dur);
+                let style = if i == app.replay_selected {
+                    Style::default().bg(Color::DarkGray)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(Span::styled(text, style)));
+            }
+        }
+
+        let block = Block::default()
+            .title(" Replay (SELECT) ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Magenta));
+        let paragraph = Paragraph::new(lines).block(block);
+        f.render_widget(paragraph, area);
+    } else if let Some(ref rs) = app.replay_status {
+        if matches!(
+            rs.state,
+            ReplayState::Starting | ReplayState::Running
+        ) {
+            let sid = rs.session_id.as_deref().unwrap_or("?");
+            let short_id = if sid.len() > 12 { &sid[..12] } else { sid };
+            let pct = (rs.progress * 100.0).min(100.0);
+            let elapsed = rs.elapsed_secs;
+            let total = rs.total_secs;
+
+            lines.push(Line::from(vec![
+                Span::styled(" \u{25b6} ", Style::default().fg(Color::Magenta)),
+                Span::styled(
+                    match rs.state {
+                        ReplayState::Starting => "starting",
+                        ReplayState::Running => "playing",
+                        _ => "idle",
+                    },
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::from(format!("  Session: {}", short_id)));
+            lines.push(Line::from(format!(
+                "  {:.0}% | {:.1}s / {:.1}s",
+                pct, elapsed, total
+            )));
+
+            let block = Block::default().title(" Replay ").borders(Borders::ALL);
+            let paragraph = Paragraph::new(lines).block(block);
+            f.render_widget(paragraph, area);
+        } else {
+            lines.push(Line::from(Span::styled(
+                "  (idle)",
+                Style::default().fg(Color::DarkGray),
+            )));
+            let block = Block::default().title(" Replay ").borders(Borders::ALL);
+            let paragraph = Paragraph::new(lines).block(block);
+            f.render_widget(paragraph, area);
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  (idle)",
+            Style::default().fg(Color::DarkGray),
+        )));
+        let block = Block::default().title(" Replay ").borders(Borders::ALL);
+        let paragraph = Paragraph::new(lines).block(block);
+        f.render_widget(paragraph, area);
+    }
 }

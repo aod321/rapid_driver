@@ -24,6 +24,7 @@ rmpv = "1.3"
 rmp-serde = "1.3"
 base64 = "0.22"
 ureq = { version = "2.12", features = ["json"] }
+bytes = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 udev = { version = "0.9", features = ["send"] }

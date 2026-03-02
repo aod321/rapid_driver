@@ -147,6 +147,42 @@ pub fn hardware_mask_schema() -> (&'static str, &'static str) {
     )
 }
 
+/// Returns (schema_name, json_schema_string) for feasibility state messages.
+pub fn feasibility_schema() -> (&'static str, &'static str) {
+    (
+        "zumi.FeasibilityState",
+        r#"{
+  "type": "object",
+  "properties": {
+    "type": {"type": "string"},
+    "ts": {"type": "number"},
+    "timestamp": {
+      "type": "object",
+      "properties": {
+        "sec": {"type": "integer"},
+        "nsec": {"type": "integer"}
+      },
+      "required": ["sec", "nsec"]
+    },
+    "state": {"type": "integer"},
+    "rawState": {"type": "integer"},
+    "ikConverged": {"type": "boolean"},
+    "positionError": {"type": "number"},
+    "orientationError": {"type": "number"},
+    "manipulability": {"type": "number"},
+    "maxJointRateRatio": {"type": "number"},
+    "withinJointLimits": {"type": "boolean"},
+    "withinVelocityLimits": {"type": "boolean"},
+    "selfCollision": {"type": "boolean"},
+    "nearSingularity": {"type": "boolean"},
+    "jointAngles": {"type": "array", "items": {"type": "number"}},
+    "collectionMode": {"type": "string"},
+    "taskLabel": {"type": "string"}
+  }
+}"#,
+    )
+}
+
 /// Map a message type string to its (schema_name, topic_suffix).
 /// Returns None for unknown message types.
 pub fn msg_type_to_schema_and_suffix(msg_type: &str) -> Option<(&'static str, &'static str)> {
@@ -156,6 +192,7 @@ pub fn msg_type_to_schema_and_suffix(msg_type: &str) -> Option<(&'static str, &'
         "image" => Some(("foxglove.CompressedImage", "/image")),
         "iphone_pose" => Some(("foxglove.PoseInFrame", "/pose")),
         "recording_start" | "recording_stop" => Some(("zumi.GoProMetadata", "/metadata")),
+        "feasibility" => Some(("zumi.FeasibilityState", "/feasibility")),
         _ => None,
     }
 }
@@ -169,6 +206,7 @@ pub fn all_schemas() -> Vec<(&'static str, &'static str)> {
         iphone_pose_schema(),
         gopro_meta_schema(),
         hardware_mask_schema(),
+        feasibility_schema(),
     ]
 }
 
@@ -209,5 +247,24 @@ mod tests {
             .iter()
             .any(|(name, _)| *name == "foxglove.PoseInFrame");
         assert!(has_pose, "missing foxglove.PoseInFrame schema registration");
+    }
+
+    #[test]
+    fn maps_feasibility_type() {
+        assert_eq!(
+            msg_type_to_schema_and_suffix("feasibility"),
+            Some(("zumi.FeasibilityState", "/feasibility"))
+        );
+    }
+
+    #[test]
+    fn registers_feasibility_schema() {
+        let has_feas = all_schemas()
+            .iter()
+            .any(|(name, _)| *name == "zumi.FeasibilityState");
+        assert!(
+            has_feas,
+            "missing zumi.FeasibilityState schema registration"
+        );
     }
 }
